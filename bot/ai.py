@@ -1,9 +1,12 @@
 import os
 import json
-from groq import Groq
+import time
+from groq import Groq, RateLimitError
 from .logger import logger
 
 _client: Groq | None = None
+_last_call_time: float = 0.0
+_MIN_INTERVAL = 3.0  # segundos mínimos entre llamadas a Groq
 
 
 def _get_client() -> Groq:
@@ -14,18 +17,38 @@ def _get_client() -> Groq:
 
 
 def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
+    global _last_call_time
     from .config import get
     cfg = get()["bot"]
-    response = _get_client().chat.completions.create(
-        model=cfg["model"],
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=cfg["temperature"],
-        max_tokens=max_tokens,
-    )
-    return response.choices[0].message.content.strip()
+
+    # Respetar intervalo mínimo entre llamadas
+    elapsed = time.time() - _last_call_time
+    if elapsed < _MIN_INTERVAL:
+        time.sleep(_MIN_INTERVAL - elapsed)
+
+    retries = 3
+    wait = 15  # segundos de espera inicial en 429
+    for attempt in range(retries):
+        try:
+            _last_call_time = time.time()
+            response = _get_client().chat.completions.create(
+                model=cfg["model"],
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=cfg["temperature"],
+                max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content.strip()
+        except RateLimitError:
+            if attempt < retries - 1:
+                logger.warning(f"Rate limit de Groq — esperando {wait}s antes de reintentar ({attempt + 1}/{retries})")
+                time.sleep(wait)
+                wait *= 2  # backoff exponencial
+            else:
+                logger.error("Rate limit de Groq agotado tras varios reintentos")
+                raise
 
 
 def generate_assignment_response(

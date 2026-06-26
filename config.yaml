@@ -11,4 +11,7 @@ scheduler:
 ucnl:
   base_url: "http://licenciatura.ucnl.edu.mx/"
   auth_state_file: ".auth_state.json"
-  headless: true
+  headless: false
+
+student:
+  name: "Marco Antonio Lopez Castro"

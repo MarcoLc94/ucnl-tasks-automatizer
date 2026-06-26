@@ -6,3 +6,4 @@ groq
 apscheduler
 python-dotenv
 pyyaml
+python-docx
