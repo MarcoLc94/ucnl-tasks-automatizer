@@ -1,0 +1,14 @@
+bot:
+  model: "llama-3.3-70b-versatile"
+  temperature: 0.5
+  max_tokens: 2000
+
+scheduler:
+  scan_hour: 8
+  scan_minute: 0
+  timezone: "America/Monterrey"
+
+ucnl:
+  base_url: "http://licenciatura.ucnl.edu.mx/"
+  auth_state_file: ".auth_state.json"
+  headless: true
