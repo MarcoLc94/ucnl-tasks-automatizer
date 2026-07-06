@@ -56,13 +56,19 @@ SEL_ONLINE_TEXT_AREA = ".editor_atto_content, .atto_content, div[contenteditable
 SEL_SAVE_BTN         = "input[value*='Guardar'], button:has-text('Guardar'), input[type='submit']"
 
 # Examen (quiz)
-SEL_ATTEMPT_BTN      = "button:has-text('Intentar'), a:has-text('Intentar cuestionario'), .btn:has-text('Comenzar')"
-SEL_QUESTION_BLOCKS  = ".que, .question, .formulation"
+SEL_ATTEMPT_BTN      = "button:has-text('Intentar examen'), button:has-text('Intentar cuestionario'), button:has-text('Intentar'), a:has-text('Intentar cuestionario'), .btn-primary:has-text('Intentar')"
+SEL_RESUME_BTN       = "button:has-text('Continuar su intento'), button:has-text('Continuar el último intento'), button:has-text('Reanudar'), input[value*='Continuar'], input[value*='Reanudar']"
+SEL_CONFIRM_ATTEMPT  = "input[name='submitbutton'], input[value*='Iniciar intento'], input[value*='Comenzar el intento'], button:has-text('Comenzar el intento')"
+SEL_QUESTION_BLOCKS  = ".que"
 SEL_QUESTION_TEXT    = ".qtext, .question-text, p"
 SEL_ANSWER_OPTIONS   = ".answer .r0, .answer .r1, .answer label, .answeroptions label"
-SEL_ANSWER_CHECKBOX  = "input[type='checkbox'], input[type='radio']"
+SEL_ANSWER_CHECKBOX  = "input[type='radio'], input[type='checkbox']"
+SEL_NEXT_BTN         = "input[name='next'], button[name='next'], .mod_quiz-next-nav, input[value*='Siguiente'], button:has-text('Siguiente')"
+SEL_PREV_BTN         = "input[name='previous'], button[name='previous'], .mod_quiz-prev-nav"
+SEL_FINISH_ATTEMPT_BTN = "input[name='finishattempt'], button[name='finishattempt'], input[value*='Terminar intento'], button:has-text('Terminar intento')"
 SEL_FINISH_BTN       = "input[value*='Terminar'], button:has-text('Terminar'), .btn:has-text('Enviar')"
-SEL_CONFIRM_FINISH   = "button:has-text('Enviar'), input[value*='Enviar todo']"
+SEL_CONFIRM_FINISH   = "button:has-text('Enviar todo y terminar'), input[value*='Enviar todo']"
+SEL_CONFIRM_MODAL    = "button[data-action='save']"
 
 # ─── Browser context ─────────────────────────────────────────────────────────
 
@@ -104,7 +110,7 @@ async def _login(page: Page, context: BrowserContext) -> bool:
         logger.error("UCNL_USERNAME o UCNL_PASSWORD no están configurados en .env")
         return False
 
-    await page.goto(base_url, wait_until="networkidle")
+    await page.goto(base_url, wait_until="load")
 
     # Si ya hay sesión activa (auth_state guardado), no necesitamos login
     if await _is_logged_in(page):
@@ -116,7 +122,7 @@ async def _login(page: Page, context: BrowserContext) -> bool:
         await page.fill(SEL_USERNAME, username)
         await page.fill(SEL_PASSWORD, password)
         await page.click(SEL_LOGIN_BTN)
-        await page.wait_for_load_state("networkidle")
+        await page.wait_for_load_state("load")
 
         if not await _is_logged_in(page):
             logger.error("Login fallido — verifica usuario y contraseña")
@@ -152,17 +158,29 @@ async def get_courses(page: Page) -> list[dict]:
     cfg = get()["ucnl"]
     base_url = cfg["base_url"].rstrip("/")
     try:
-        await page.goto(f"{base_url}/my/courses.php", wait_until="networkidle")
+        await page.goto(f"{base_url}/my/courses.php", wait_until="load")
     except Exception as e:
         logger.error(f"Error navegando a Mis Cursos: {e}")
         return []
 
     course_links = await page.query_selector_all(SEL_COURSE_LINKS)
     courses = []
+    seen_urls = set()
     for link in course_links:
-        name = (await link.inner_text()).strip()
         href = await link.get_attribute("href")
-        if name and href:
+        if not href or href in seen_urls:
+            continue
+        # Extraer texto ignorando imágenes y etiquetas genéricas
+        name = await link.evaluate("""el => {
+            const clone = el.cloneNode(true);
+            clone.querySelectorAll('img').forEach(i => i.remove());
+            const lines = clone.innerText.split('\\n')
+                .map(l => l.trim())
+                .filter(l => l && l !== 'Imagen del curso' && l !== 'Nombre del curso');
+            return lines.join(' ').trim();
+        }""")
+        if name:
+            seen_urls.add(href)
             courses.append({"name": name, "url": href})
             logger.info(f"Curso encontrado: {name}")
 
@@ -175,7 +193,7 @@ async def get_course_activities(page: Page, course: dict) -> list[dict]:
     Returns: list of {title, url, type: 'assignment'|'quiz'}
     """
     try:
-        await page.goto(course["url"], wait_until="networkidle")
+        await page.goto(course["url"], wait_until="load")
     except Exception as e:
         logger.error(f"Error entrando al curso {course['name']}: {e}")
         return []
@@ -219,7 +237,7 @@ async def get_assignment_details(page: Page, activity: dict) -> dict | None:
     Returns: {description, already_submitted, is_past_due, due_date} or None on error.
     """
     try:
-        await page.goto(activity["url"], wait_until="networkidle")
+        await page.goto(activity["url"], wait_until="load")
     except Exception as e:
         logger.error(f"Error entrando a tarea {activity['title']}: {e}")
         return None
@@ -269,80 +287,126 @@ async def get_assignment_details(page: Page, activity: dict) -> dict | None:
     }
 
 
-async def get_quiz_details(page: Page, activity: dict) -> dict:
-    """
-    Enter a quiz page and extract state + questions.
-    Returns: {
-        already_completed: bool,
-        available_from: str | None,  # si aún no está disponible
-        questions: list[dict] | None,
-    }
-    """
-    result = {"already_completed": False, "available_from": None, "questions": None}
-
-    try:
-        await page.goto(activity["url"], wait_until="networkidle")
-    except Exception as e:
-        logger.error(f"Error entrando a examen {activity['title']}: {e}")
-        return result
-
-    page_text = (await page.inner_text("body")).lower()
-
-    # Detectar si ya fue completado
-    if any(s in page_text for s in ["ya has completado", "calificación final", "tu calificación", "revisión del intento"]):
-        logger.info(f"Examen '{activity['title']}' ya fue completado")
-        result["already_completed"] = True
-        return result
-
-    # Detectar si aún no está disponible y extraer fecha de apertura
-    if any(s in page_text for s in ["no disponible", "no está disponible", "este cuestionario no estará disponible"]):
-        available_el = await page.query_selector(".quizinfo, .alert, .generalbox")
-        if available_el:
-            result["available_from"] = (await available_el.inner_text()).strip()
-        else:
-            result["available_from"] = "Fecha de apertura no disponible"
-        return result
-
-    # Intentar hacer click en botón de inicio
-    try:
-        attempt_btn = await page.query_selector(SEL_ATTEMPT_BTN)
-        if attempt_btn:
-            await attempt_btn.click()
-            await page.wait_for_load_state("networkidle")
-            confirm = await page.query_selector("button:has-text('Comenzar el intento')")
-            if confirm:
-                await confirm.click()
-                await page.wait_for_load_state("networkidle")
-    except Exception as e:
-        logger.warning(f"No se pudo hacer clic en 'Intentar': {e}")
-
+async def _extract_page_questions(page: Page) -> list[dict]:
+    """Extract all question blocks visible on the current page."""
     question_blocks = await page.query_selector_all(SEL_QUESTION_BLOCKS)
     questions = []
-
     for block in question_blocks:
         try:
             q_el = await block.query_selector(SEL_QUESTION_TEXT)
             question_text = (await q_el.inner_text()).strip() if q_el else ""
             if not question_text:
                 continue
-
             answer_labels = await block.query_selector_all(SEL_ANSWER_OPTIONS)
             options = [
                 (await label.inner_text()).strip()
                 for label in answer_labels
                 if (await label.inner_text()).strip()
             ]
-
             radios = await block.query_selector_all("input[type='radio']")
             checkboxes = await block.query_selector_all("input[type='checkbox']")
             q_type = "single" if radios else ("multiple" if checkboxes else "single")
-
             questions.append({"question": question_text, "options": options, "type": q_type})
         except Exception:
             continue
+    return questions
 
-    logger.info(f"Examen '{activity['title']}': {len(questions)} preguntas extraídas")
-    result["questions"] = questions if questions else None
+
+async def _start_or_resume_attempt(page: Page) -> None:
+    """Click the attempt/resume button and confirm the start dialog if it appears."""
+    attempt_btn = await page.query_selector(SEL_ATTEMPT_BTN)
+    resume_btn = await page.query_selector(SEL_RESUME_BTN)
+    btn = attempt_btn or resume_btn
+    if btn:
+        await btn.click()
+        await page.wait_for_load_state("load")
+    # Moodle muestra una página de confirmación antes de iniciar el intento
+    confirm = await page.query_selector(SEL_CONFIRM_ATTEMPT)
+    if confirm:
+        await confirm.click()
+        await page.wait_for_load_state("load")
+
+
+async def _go_to_question_one(page: Page) -> None:
+    """Navigate to question 1 via Moodle's quiz navigation block or by going back page by page."""
+    try:
+        # Opción 1: panel de navegación lateral (salto directo)
+        nav_btns = await page.query_selector_all(".qnbutton")
+        if nav_btns:
+            await nav_btns[0].click()
+            await page.wait_for_load_state("load")
+            logger.info("Navegado a pregunta 1 via panel de navegación")
+            return
+
+        # Opción 2: links en el resumen del intento
+        summary_links = await page.query_selector_all(".quizsummaryofattempt td a, .mod_quiz-attempt-summary td a")
+        if summary_links:
+            await summary_links[0].click()
+            await page.wait_for_load_state("load")
+            logger.info("Navegado a pregunta 1 desde resumen del intento")
+            return
+
+        # Opción 3: retroceder página por página con "Página anterior"
+        for _ in range(100):
+            prev_btn = await page.query_selector(SEL_PREV_BTN)
+            if not prev_btn:
+                break
+            await prev_btn.click()
+            await page.wait_for_load_state("load")
+        logger.info("Navegado a pregunta 1 via botón 'Página anterior'")
+    except Exception as e:
+        logger.warning(f"No se pudo navegar a pregunta 1: {e}")
+
+
+async def get_quiz_details(page: Page, activity: dict) -> dict:
+    """
+    Check a quiz page during scan — does NOT start an attempt.
+    Returns: {already_completed, available_from, questions=None}
+    questions is always None; answering happens in real-time during submit_quiz.
+    """
+    result = {"already_completed": False, "available_from": None, "questions": None}
+
+    try:
+        await page.goto(activity["url"], wait_until="load")
+    except Exception as e:
+        logger.error(f"Error entrando a examen {activity['title']}: {e}")
+        return result
+
+    page_text = (await page.inner_text("body")).lower()
+
+    import re
+
+    already_completed = False
+    grade_text = ""
+
+    # Señal fuerte: tabla de intentos con calificación numérica real (ej: "9.67 / 10.00")
+    # Solo aparece cuando hay un intento efectivamente terminado y calificado
+    summary_table = await page.query_selector(".quizattemptcounts, table.generaltable")
+    if summary_table:
+        table_text = await summary_table.inner_text()
+        grade_match = re.search(r"(\d+[.,]\d+)\s*/\s*(\d+[.,]\d+)", table_text)
+        if grade_match:
+            already_completed = True
+            grade_text = grade_match.group(0)
+
+    # Señal de respaldo: frases que solo aparecen en página post-entrega, nunca en info del examen
+    if not already_completed:
+        strong_signals = ["ya has completado", "revisión del intento", "intento terminado"]
+        if any(s in page_text for s in strong_signals):
+            already_completed = True
+
+    if already_completed:
+        logger.info(f"Examen '{activity['title']}' ya completado. Calificación: {grade_text or 'N/A'}")
+        result["already_completed"] = True
+        result["grade"] = grade_text
+        return result
+
+    if any(s in page_text for s in ["no disponible", "no está disponible", "este cuestionario no estará disponible"]):
+        available_el = await page.query_selector(".quizinfo, .alert, .generalbox")
+        result["available_from"] = (await available_el.inner_text()).strip() if available_el else "Fecha no disponible"
+        return result
+
+    logger.info(f"Examen '{activity['title']}' disponible — se responderá en tiempo real al aprobar")
     return result
 
 
@@ -377,7 +441,7 @@ async def submit_assignment(
             if not await _login(page, context):
                 return False
 
-            await page.goto(task_url, wait_until="networkidle")
+            await page.goto(task_url, wait_until="load")
 
             # Click 'Agregar entrega' o 'Editar entrega'
             submit_btn = await page.query_selector(SEL_SUBMIT_BTN)
@@ -385,7 +449,7 @@ async def submit_assignment(
                 logger.error(f"No se encontró botón de entrega en: {task_url}")
                 return False
             await submit_btn.click()
-            await page.wait_for_load_state("networkidle")
+            await page.wait_for_load_state("load")
 
             # Intentar subir el DOCX (Moodle file manager)
             uploaded = await _upload_file(page, docx_path)
@@ -411,7 +475,7 @@ async def submit_assignment(
             save_btn = await page.query_selector(SEL_SAVE_BTN)
             if save_btn:
                 await save_btn.click()
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("load")
                 logger.info(f"Tarea entregada exitosamente: {task_url}")
                 await context.storage_state(path=str(_AUTH_STATE_PATH))
                 return True
@@ -460,7 +524,7 @@ async def _upload_file(page: Page, file_path) -> bool:
             )
             if upload_btn:
                 await upload_btn.click()
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("load")
                 return True
 
         return False
@@ -469,51 +533,100 @@ async def _upload_file(page: Page, file_path) -> bool:
         return False
 
 
-async def submit_quiz(task_url: str, questions: list[dict]) -> bool:
+async def submit_quiz(task_url: str, course_name: str = "") -> bool:
     """
-    Navigate to quiz, fill in answers, and submit.
-    questions: list with {question, options, type, selected_indices}
+    Enter/resume a quiz and answer every question in real-time with AI.
+    Navigates backwards to question 1 first, then forward answering each page.
     """
+    from .ai import analyze_single_question
+
     async with async_playwright() as p:
         browser, context, page = await _new_context(p)
         try:
             if not await _login(page, context):
                 return False
 
-            await page.goto(task_url, wait_until="networkidle")
+            await page.goto(task_url, wait_until="load")
+            await _start_or_resume_attempt(page)
 
-            # Click attempt button
-            attempt_btn = await page.query_selector(SEL_ATTEMPT_BTN)
-            if attempt_btn:
-                await attempt_btn.click()
-                await page.wait_for_load_state("networkidle")
-                confirm = await page.query_selector("button:has-text('Comenzar el intento')")
-                if confirm:
-                    await confirm.click()
-                    await page.wait_for_load_state("networkidle")
+            # Retroceder hasta la primera pregunta
+            logger.info("Retrocediendo hasta la pregunta 1...")
+            for _ in range(100):
+                prev_btn = await page.query_selector(SEL_PREV_BTN)
+                if not prev_btn:
+                    break
+                await prev_btn.click()
+                await page.wait_for_load_state("load")
+            logger.info("En la primera pregunta — comenzando respuestas")
 
-            question_blocks = await page.query_selector_all(SEL_QUESTION_BLOCKS)
+            # Contestar pregunta por pregunta hacia adelante
+            answered = 0
+            for _ in range(100):
+                question_blocks = await page.query_selector_all(SEL_QUESTION_BLOCKS)
 
-            for i, (block, q_data) in enumerate(zip(question_blocks, questions)):
-                try:
-                    selected = q_data.get("selected_indices", [0])
-                    inputs = await block.query_selector_all(SEL_ANSWER_CHECKBOX)
-                    for idx in selected:
-                        if idx < len(inputs):
-                            await inputs[idx].check()
-                except Exception as e:
-                    logger.warning(f"Error marcando respuesta {i}: {e}")
+                for block in question_blocks:
+                    try:
+                        q_el = await block.query_selector(SEL_QUESTION_TEXT)
+                        question_text = (await q_el.inner_text()).strip() if q_el else ""
+                        if not question_text:
+                            continue
 
-            # Finish quiz
-            finish_btn = await page.query_selector(SEL_FINISH_BTN)
-            if finish_btn:
-                await finish_btn.click()
-                await page.wait_for_load_state("networkidle")
+                        answer_labels = await block.query_selector_all(SEL_ANSWER_OPTIONS)
+                        options = [
+                            (await lbl.inner_text()).strip()
+                            for lbl in answer_labels
+                            if (await lbl.inner_text()).strip()
+                        ]
+                        if not options:
+                            continue
 
+                        selected_idx = analyze_single_question(course_name, question_text, options)
+                        inputs = await block.query_selector_all(SEL_ANSWER_CHECKBOX)
+                        target = inputs[selected_idx] if selected_idx < len(inputs) else (inputs[0] if inputs else None)
+                        if target:
+                            await target.check()
+                        answered += 1
+                        logger.info(f"Pregunta {answered} respondida — opción {selected_idx}: {options[selected_idx] if selected_idx < len(options) else '?'}")
+                    except Exception as e:
+                        logger.warning(f"Error respondiendo pregunta: {e}")
+
+                next_btn = await page.query_selector(SEL_NEXT_BTN)
+                if next_btn:
+                    await next_btn.click()
+                    await page.wait_for_load_state("load")
+                else:
+                    break
+
+            logger.info(f"Total preguntas respondidas: {answered}")
+
+            # Al llegar aquí ya estamos en la página de resumen del intento:
+            # el botón "Terminar intento ..." de la última pregunta tiene name="next"
+            # y el bot ya lo clickeó como parte del loop de "Siguiente".
+            # En el resumen aparece directamente "Enviar todo y terminar".
+            # Fallback: si por algún motivo aún no llegamos al resumen, buscar botón intermedio.
             confirm_btn = await page.query_selector(SEL_CONFIRM_FINISH)
-            if confirm_btn:
-                await confirm_btn.click()
-                await page.wait_for_load_state("networkidle")
+            if not confirm_btn:
+                intermediate = await page.query_selector(SEL_FINISH_ATTEMPT_BTN) or await page.query_selector(SEL_FINISH_BTN)
+                if intermediate:
+                    await intermediate.click()
+                    await page.wait_for_load_state("load")
+                    confirm_btn = await page.query_selector(SEL_CONFIRM_FINISH)
+
+            if not confirm_btn:
+                logger.error("No se encontró botón 'Enviar todo y terminar' en el resumen")
+                return False
+
+            await confirm_btn.click()
+            # El modal se abre por JS — esperar a que se renderice completamente
+            try:
+                await page.wait_for_selector(SEL_CONFIRM_MODAL, timeout=8000)
+                await page.wait_for_timeout(800)
+                logger.info("Modal de confirmación detectado — enviando examen")
+                await page.evaluate("document.querySelector('[data-action=\"save\"]').click()")
+                await page.wait_for_load_state("load")
+            except Exception as e:
+                logger.error(f"Modal de confirmación no apareció: {e}")
+                return False
 
             logger.info(f"Examen entregado exitosamente: {task_url}")
             await context.storage_state(path=str(_AUTH_STATE_PATH))
@@ -606,7 +719,7 @@ async def scan_debug() -> None:
                 await page.fill(SEL_USERNAME, username)
                 await page.fill(SEL_PASSWORD, password)
                 await page.click(SEL_LOGIN_BTN)
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("load")
                 print(f"[DEBUG] Post-login URL: {page.url}")
             except Exception as e:
                 print(f"[DEBUG] Error en login: {e}")

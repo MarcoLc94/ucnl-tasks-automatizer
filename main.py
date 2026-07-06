@@ -13,7 +13,7 @@ from bot import config as cfg_module
 from bot.scheduler import scheduler
 from bot.logger import logger
 from bot import state as st
-from bot.ai import generate_assignment_response, analyze_exam
+from bot.ai import generate_assignment_response
 from bot.browser import run_scan, submit_assignment, submit_quiz
 
 # ─── Scan logic ───────────────────────────────────────────────────────────────
@@ -39,7 +39,7 @@ async def do_scan():
             task_title = activity["title"]
             task_url = activity["url"]
 
-            if st.is_duplicate(course_name, task_title):
+            if st.is_duplicate(course_name, task_title, task_url):
                 logger.info(f"Ya registrada: {task_title}")
                 continue
 
@@ -87,24 +87,11 @@ async def do_scan():
                     status = "future"
                     exam_questions = []
                     description = f"Disponible: {available_from}"
-                elif questions_raw:
-                    answered = analyze_exam(course_name, questions_raw)
-                    from bot.state import ExamQuestion
-                    exam_questions = [
-                        ExamQuestion(
-                            question=q["question"],
-                            options=q["options"],
-                            question_type=q["type"],
-                            ai_selected=q.get("selected_indices", [0]),
-                        )
-                        for q in answered
-                    ]
-                    status = "pending_approval"
-                    description = f"Examen con {len(answered)} preguntas"
                 else:
-                    status = "expired"
+                    # Examen disponible — el bot responderá en tiempo real al aprobar
+                    status = "pending_approval"
                     exam_questions = []
-                    description = "Examen no disponible"
+                    description = "Examen disponible — el bot responderá cada pregunta en tiempo real al aprobar"
 
                 st.add_task(
                     course_name=course_name,
@@ -195,6 +182,56 @@ def reject_task(task_id: str):
     return {"status": "rejected", "task_id": task_id}
 
 
+@app.post("/api/attempt/{task_id}")
+async def attempt_task(task_id: str, background_tasks: BackgroundTasks):
+    task = st.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    if task.task_type != "exam":
+        raise HTTPException(status_code=400, detail="Solo aplica para exámenes")
+    if task.status not in ("future", "failed", "rejected", "expired"):
+        raise HTTPException(status_code=400, detail=f"No se puede intentar en estado: {task.status}")
+    background_tasks.add_task(_fetch_and_analyze_quiz, task_id)
+    return {"status": "attempt_started", "task_id": task_id}
+
+
+async def _fetch_and_analyze_quiz(task_id: str):
+    """Re-check availability for exams in future/failed/rejected state."""
+    from bot.browser import get_quiz_details
+    task = st.get_task(task_id)
+    if not task:
+        return
+    try:
+        activity = {"title": task.task_title, "url": task.task_url}
+        async with __import__("playwright.async_api", fromlist=["async_playwright"]).async_playwright() as p:
+            from bot.browser import _new_context, _login
+            browser, context, page = await _new_context(p)
+            try:
+                if not await _login(page, context):
+                    st.update_status(task_id, "failed")
+                    return
+                quiz = await get_quiz_details(page, activity)
+            finally:
+                await browser.close()
+
+        if quiz.get("already_completed"):
+            grade = quiz.get("grade", "")
+            desc = f"Examen completado — Calificación: {grade}" if grade else "Examen completado"
+            st.update_description(task_id, desc)
+            st.update_status(task_id, "done")
+            logger.info(f"Examen {task_id} completado. {desc}")
+        elif quiz.get("available_from"):
+            st.update_status(task_id, "future")
+            logger.info(f"Examen {task_id} aún no disponible: {quiz['available_from']}")
+        else:
+            description = "Examen disponible — el bot responderá cada pregunta en tiempo real al aprobar"
+            st.update_exam_questions(task_id, [], description)
+            logger.info(f"Examen {task_id} disponible para aprobar")
+    except Exception as e:
+        logger.error(f"Error al verificar examen {task_id}: {e}")
+        st.update_status(task_id, "failed")
+
+
 @app.post("/api/scan")
 async def trigger_scan(background_tasks: BackgroundTasks):
     if _scan_running:
@@ -231,16 +268,7 @@ async def _submit_task(task_id: str):
                 task_title=task.task_title,
             )
         else:
-            questions = [
-                {
-                    "question": q.question,
-                    "options": q.options,
-                    "type": q.question_type,
-                    "selected_indices": q.ai_selected,
-                }
-                for q in task.exam_questions
-            ]
-            ok = await submit_quiz(task.task_url, questions)
+            ok = await submit_quiz(task.task_url, course_name=task.course_name)
 
         st.update_status(task_id, "submitted" if ok else "failed")
         logger.info(f"Tarea {task_id} {'entregada' if ok else 'FALLÓ al entregar'}")
@@ -444,6 +472,7 @@ function renderTask(t) {
   }
 
   const canAct = t.status === 'pending_approval';
+  const canAttempt = t.task_type === 'exam' && ['future', 'failed', 'rejected', 'expired'].includes(t.status);
   const actions = canAct ? `
     <div class="mt-4 flex gap-3">
       <button onclick="approve('${t.id}', '${t.task_type}')"
@@ -453,6 +482,13 @@ function renderTask(t) {
       <button onclick="reject('${t.id}')"
         class="bg-red-100 text-red-700 text-sm px-5 py-2 rounded-lg hover:bg-red-200 font-medium">
         Rechazar
+      </button>
+    </div>
+  ` : canAttempt ? `
+    <div class="mt-4 flex gap-3">
+      <button onclick="attemptExam('${t.id}')"
+        class="bg-purple-600 text-white text-sm px-5 py-2 rounded-lg hover:bg-purple-700 font-medium">
+        Intentar examen ahora
       </button>
     </div>
   ` : '';
@@ -499,6 +535,18 @@ async function approve(taskId, type) {
 
 async function reject(taskId) {
   await fetch(`/api/reject/${taskId}`, { method: 'POST' });
+  loadTasks();
+  loadStatus();
+}
+
+async function attemptExam(taskId) {
+  const r = await fetch(`/api/attempt/${taskId}`, { method: 'POST' });
+  const d = await r.json();
+  if (d.status === 'attempt_started') {
+    alert('El bot está entrando al examen y generando respuestas. Actualiza en unos minutos.');
+  } else {
+    alert('Error: ' + JSON.stringify(d));
+  }
   loadTasks();
   loadStatus();
 }

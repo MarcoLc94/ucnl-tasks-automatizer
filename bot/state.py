@@ -149,8 +149,31 @@ def update_response(task_id: str, new_response: str) -> bool:
     return True
 
 
-def is_duplicate(course_name: str, task_title: str) -> bool:
+def update_description(task_id: str, description: str) -> bool:
+    task = _tasks.get(task_id)
+    if not task:
+        return False
+    task.task_description = description
+    _persist()
+    return True
+
+
+def update_exam_questions(task_id: str, questions: list[ExamQuestion], description: str) -> bool:
+    task = _tasks.get(task_id)
+    if not task:
+        return False
+    task.exam_questions = questions
+    task.task_description = description
+    task.status = "pending_approval"
+    task.available_from = None
+    _persist()
+    return True
+
+
+def is_duplicate(course_name: str, task_title: str, task_url: str = "") -> bool:
     for task in _tasks.values():
+        if task_url and task.task_url == task_url:
+            return True
         if task.course_name == course_name and task.task_title == task_title:
             return True
     return False

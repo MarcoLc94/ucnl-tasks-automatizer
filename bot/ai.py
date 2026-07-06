@@ -73,6 +73,24 @@ Redacta una respuesta completa y bien argumentada para esta tarea."""
     return _chat(system, user)
 
 
+def analyze_single_question(course_name: str, question: str, options: list[str]) -> int:
+    """Analyze one exam question in real-time and return the index of the best answer."""
+    options_text = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options))
+    system = (
+        "Eres un estudiante universitario de Ingeniería en Desarrollo de Software en la UCNL. "
+        "Responde la pregunta eligiendo la opción más correcta. "
+        "Responde ÚNICAMENTE con el número del índice (0, 1, 2…). Sin texto adicional."
+    )
+    user = f"Materia: {course_name}\n\nPregunta: {question}\n\nOpciones:\n{options_text}\n\n¿Índice de la respuesta correcta?"
+    try:
+        raw = _chat(system, user, max_tokens=10)
+        idx = int("".join(c for c in raw.strip() if c.isdigit())[:1])
+        return idx if 0 <= idx < len(options) else 0
+    except Exception as e:
+        logger.error(f"Error analizando pregunta individual: {e}")
+        return 0
+
+
 def analyze_exam(
     course_name: str,
     questions_raw: list[dict],
