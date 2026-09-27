@@ -4,14 +4,9 @@ bot:
   max_tokens: 2000
 
 scheduler:
-  scan_hour: 8
-  scan_minute: 0
+  # La hora del escaneo diario ahora es por usuario (panel → Mi cuenta)
   timezone: "America/Monterrey"
 
 ucnl:
   base_url: "http://licenciatura.ucnl.edu.mx/"
-  auth_state_file: ".auth_state.json"
   headless: false
-
-student:
-  name: "Marco Antonio Lopez Castro"

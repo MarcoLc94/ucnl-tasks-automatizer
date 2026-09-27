@@ -51,15 +51,61 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
                 raise
 
 
+_FORMAT_GUIDE = {
+    "docx": (
+        "El resultado será un documento de Word. Redacta un trabajo académico completo: "
+        "introducción, desarrollo en varias secciones con párrafos bien argumentados, y conclusión. "
+        "Agrega referencias al final si aplica.",
+        3500,
+    ),
+    "pdf": (
+        "El resultado será un reporte en PDF. Redacta un trabajo académico completo: "
+        "introducción, desarrollo en varias secciones con párrafos bien argumentados, y conclusión. "
+        "Agrega referencias al final si aplica.",
+        3500,
+    ),
+    "pptx": (
+        "El resultado será una presentación de PowerPoint. Cada sección '##' se convierte en una "
+        "diapositiva: usa entre 6 y 10 secciones, cada una con 3 a 5 viñetas breves (máximo 20 palabras "
+        "cada una). Evita párrafos largos. Termina con una sección de conclusiones.",
+        2500,
+    ),
+    "triptico": (
+        "El resultado será un tríptico (folleto de 6 paneles). Usa de 5 a 7 secciones '##' cortas y "
+        "llamativas, con frases concisas y viñetas. En total no más de 450 palabras. La última sección "
+        "debe ser un cierre (conclusión, datos clave o recomendaciones).",
+        2000,
+    ),
+}
+
+_MARKDOWN_RULES = """Escribe la respuesta en Markdown usando SOLO estos elementos:
+- "## Título de sección" y "### Subtítulo"
+- Párrafos normales, **negritas** y *cursivas*
+- Listas con "- " o "1. "
+- Tablas Markdown (| col | col | con fila separadora |---|---|) cuando comparar información ayude
+- Gráficas, SOLO si la tarea lo pide o si hay datos reales y conocidos que graficar (nunca inventes estadísticas), con este bloque exacto:
+```grafica
+{"tipo": "barras", "titulo": "Título", "etiquetas": ["A", "B", "C"], "series": [{"nombre": "Serie", "valores": [10, 20, 30]}]}
+```
+  (tipo puede ser "barras", "lineas" o "pastel")
+No incluyas portada, nombre del alumno, fecha ni el título de la tarea: eso se agrega automáticamente.
+No uses ningún otro tipo de bloque de código."""
+
+
 def generate_assignment_response(
     course_name: str,
     task_title: str,
     task_description: str,
+    output_format: str = "docx",
 ) -> str:
-    system = """Eres un estudiante universitario aplicado de la Universidad Ciudadana de Nuevo León (UCNL)
+    guide, max_tokens = _FORMAT_GUIDE.get(output_format, _FORMAT_GUIDE["docx"])
+    system = f"""Eres un estudiante universitario aplicado de la Universidad Ciudadana de Nuevo León (UCNL)
 cursando Ingeniería en Desarrollo de Software. Debes redactar respuestas académicas completas,
-bien estructuradas y en español. Usa un tono formal pero claro. Responde directamente al contenido
-de la tarea sin agregar encabezados innecesarios."""
+bien estructuradas y en español. Usa un tono formal pero claro.
+
+{guide}
+
+{_MARKDOWN_RULES}"""
 
     user = f"""Materia: {course_name}
 Tarea: {task_title}
@@ -67,10 +113,10 @@ Tarea: {task_title}
 Instrucciones de la tarea:
 {task_description}
 
-Redacta una respuesta completa y bien argumentada para esta tarea."""
+Redacta el contenido completo para esta tarea."""
 
-    logger.info(f"Generando respuesta IA para tarea: {task_title}")
-    return _chat(system, user)
+    logger.info(f"Generando respuesta IA ({output_format}) para tarea: {task_title}")
+    return _chat(system, user, max_tokens=max_tokens)
 
 
 def analyze_single_question(course_name: str, question: str, options: list[str]) -> int:

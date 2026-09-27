@@ -7,3 +7,6 @@ apscheduler
 python-dotenv
 pyyaml
 python-docx
+python-pptx
+matplotlib
+cryptography

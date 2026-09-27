@@ -10,11 +10,13 @@ SELECTORS NOTE:
 import os
 import json
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 from .config import get
 from .logger import logger
+from .users import User
 
 try:
     from playwright_stealth import stealth_async
@@ -72,17 +74,36 @@ SEL_CONFIRM_MODAL    = "button[data-action='save']"
 
 # ─── Browser context ─────────────────────────────────────────────────────────
 
-_AUTH_STATE_PATH = Path(__file__).parent.parent / get()["ucnl"]["auth_state_file"]
+# Cada Chromium consume ~300-500 MB: limitar cuántos corren a la vez entre todos los usuarios
+_BROWSER_SLOTS = asyncio.Semaphore(int(os.getenv("MAX_BROWSERS", "2")))
 
 
-async def _new_context(playwright, save_auth: bool = False) -> tuple:
-    cfg = get()["ucnl"]
+def _headless() -> bool:
+    env = os.getenv("HEADLESS")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes")
+    return get()["ucnl"].get("headless", True)
+
+
+@asynccontextmanager
+async def browser_session(user: User):
+    """Abre un Chromium con la sesión guardada del usuario. Espera turno si ya hay MAX_BROWSERS abiertos."""
+    async with _BROWSER_SLOTS:
+        async with async_playwright() as p:
+            browser, context, page = await _new_context(p, user)
+            try:
+                yield context, page
+            finally:
+                await browser.close()
+
+
+async def _new_context(playwright, user: User) -> tuple:
     browser = await playwright.chromium.launch(
-        headless=cfg.get("headless", True),
+        headless=_headless(),
         args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
     )
 
-    storage_state = str(_AUTH_STATE_PATH) if _AUTH_STATE_PATH.exists() else None
+    storage_state = str(user.auth_state_path) if user.auth_state_path.exists() else None
     context = await browser.new_context(
         storage_state=storage_state,
         user_agent=(
@@ -100,24 +121,24 @@ async def _new_context(playwright, save_auth: bool = False) -> tuple:
     return browser, context, page
 
 
-async def _login(page: Page, context: BrowserContext) -> bool:
+async def _login(page: Page, context: BrowserContext, user: User) -> bool:
     cfg = get()["ucnl"]
     base_url = cfg["base_url"]
-    username = os.getenv("UCNL_USERNAME", "")
-    password = os.getenv("UCNL_PASSWORD", "")
+    username = user.ucnl_username
+    password = user.ucnl_password
 
     if not username or not password:
-        logger.error("UCNL_USERNAME o UCNL_PASSWORD no están configurados en .env")
+        logger.error(f"[{user.username}] No tiene credenciales de UCNL configuradas")
         return False
 
     await page.goto(base_url, wait_until="load")
 
     # Si ya hay sesión activa (auth_state guardado), no necesitamos login
     if await _is_logged_in(page):
-        logger.info("Sesión activa reutilizada")
+        logger.info(f"[{user.username}] Sesión activa reutilizada")
         return True
 
-    logger.info("Iniciando sesión...")
+    logger.info(f"[{user.username}] Iniciando sesión...")
     try:
         await page.fill(SEL_USERNAME, username)
         await page.fill(SEL_PASSWORD, password)
@@ -125,12 +146,12 @@ async def _login(page: Page, context: BrowserContext) -> bool:
         await page.wait_for_load_state("load")
 
         if not await _is_logged_in(page):
-            logger.error("Login fallido — verifica usuario y contraseña")
+            logger.error(f"[{user.username}] Login fallido — verifica usuario y contraseña")
             return False
 
         # Guardar estado de autenticación para reutilizar
-        await context.storage_state(path=str(_AUTH_STATE_PATH))
-        logger.info("Login exitoso — sesión guardada")
+        await context.storage_state(path=str(user.auth_state_path))
+        logger.info(f"[{user.username}] Login exitoso — sesión guardada")
         return True
 
     except Exception as e:
@@ -413,32 +434,34 @@ async def get_quiz_details(page: Page, activity: dict) -> dict:
 # ─── Submit ───────────────────────────────────────────────────────────────────
 
 async def submit_assignment(
+    user: User,
     task_url: str,
     response_text: str,
     course_name: str = "",
     task_title: str = "",
+    output_format: str = "docx",
 ) -> bool:
-    """Generate DOCX and upload it to the Moodle assignment."""
-    from pathlib import Path
-    from .document import generate_docx
+    """Generate the document in the chosen format and upload it to the Moodle assignment."""
+    from .renderers import build_document
 
-    cfg = get()
-    student_name = cfg.get("student", {}).get("name", "Estudiante")
-    docs_dir = Path(__file__).parent.parent / "data" / "docs"
-
-    docx_path = generate_docx(
+    doc_args = dict(
+        markdown_text=response_text,
         course_name=course_name,
         task_title=task_title or task_url,
-        response_text=response_text,
-        student_name=student_name,
-        output_dir=docs_dir,
+        student_name=user.display_name,
+        output_dir=user.docs_dir,
     )
-    logger.info(f"DOCX generado: {docx_path.name}")
+    try:
+        doc_path = await build_document(output_format, **doc_args)
+    except Exception as e:
+        if output_format == "docx":
+            raise
+        logger.error(f"Error generando {output_format} ({e}) — se entregará como Word")
+        doc_path = await build_document("docx", **doc_args)
 
-    async with async_playwright() as p:
-        browser, context, page = await _new_context(p)
+    async with browser_session(user) as (context, page):
         try:
-            if not await _login(page, context):
+            if not await _login(page, context, user):
                 return False
 
             await page.goto(task_url, wait_until="load")
@@ -451,8 +474,8 @@ async def submit_assignment(
             await submit_btn.click()
             await page.wait_for_load_state("load")
 
-            # Intentar subir el DOCX (Moodle file manager)
-            uploaded = await _upload_file(page, docx_path)
+            # Intentar subir el documento (Moodle file manager)
+            uploaded = await _upload_file(page, doc_path)
 
             if not uploaded:
                 # Fallback: si la tarea acepta texto en línea, usar el editor
@@ -477,7 +500,7 @@ async def submit_assignment(
                 await save_btn.click()
                 await page.wait_for_load_state("load")
                 logger.info(f"Tarea entregada exitosamente: {task_url}")
-                await context.storage_state(path=str(_AUTH_STATE_PATH))
+                await context.storage_state(path=str(user.auth_state_path))
                 return True
             else:
                 logger.error("No se encontró botón 'Guardar'")
@@ -486,8 +509,6 @@ async def submit_assignment(
         except Exception as e:
             logger.error(f"Error al entregar tarea: {e}")
             return False
-        finally:
-            await browser.close()
 
 
 async def _upload_file(page: Page, file_path) -> bool:
@@ -533,17 +554,16 @@ async def _upload_file(page: Page, file_path) -> bool:
         return False
 
 
-async def submit_quiz(task_url: str, course_name: str = "") -> bool:
+async def submit_quiz(user: User, task_url: str, course_name: str = "") -> bool:
     """
     Enter/resume a quiz and answer every question in real-time with AI.
     Navigates backwards to question 1 first, then forward answering each page.
     """
     from .ai import analyze_single_question
 
-    async with async_playwright() as p:
-        browser, context, page = await _new_context(p)
+    async with browser_session(user) as (context, page):
         try:
-            if not await _login(page, context):
+            if not await _login(page, context, user):
                 return False
 
             await page.goto(task_url, wait_until="load")
@@ -629,28 +649,25 @@ async def submit_quiz(task_url: str, course_name: str = "") -> bool:
                 return False
 
             logger.info(f"Examen entregado exitosamente: {task_url}")
-            await context.storage_state(path=str(_AUTH_STATE_PATH))
+            await context.storage_state(path=str(user.auth_state_path))
             return True
 
         except Exception as e:
             logger.error(f"Error al entregar examen: {e}")
             return False
-        finally:
-            await browser.close()
 
 
 # ─── Main scan entry point ────────────────────────────────────────────────────
 
-async def run_scan() -> list[dict]:
+async def run_scan(user: User) -> list[dict]:
     """
     Full scan: login → get courses → check activities → return raw data.
     State updates are handled by the caller (main.py).
     Returns list of {course, activity, details} dicts for NEW pending items.
     """
-    async with async_playwright() as p:
-        browser, context, page = await _new_context(p)
+    async with browser_session(user) as (context, page):
         try:
-            if not await _login(page, context):
+            if not await _login(page, context, user):
                 return []
 
             courses = await get_courses(page)
@@ -682,10 +699,8 @@ async def run_scan() -> list[dict]:
             return results
 
         except Exception as e:
-            logger.error(f"Error durante el escaneo: {e}")
+            logger.error(f"[{user.username}] Error durante el escaneo: {e}")
             return []
-        finally:
-            await browser.close()
 
 
 async def scan_debug() -> None:
