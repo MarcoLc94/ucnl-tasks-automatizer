@@ -8,8 +8,11 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.util import Inches, Pt
 
+from PIL import Image
+
+from ..images import fetch_photo
 from .charts import PALETTE, normalize_chart
-from .common import CoverInfo
+from .common import CoverInfo, reference_entries, split_document
 from .markdown import inline_runs, parse, plain, split_sections
 
 PRIMARY = RGBColor(0x1F, 0x3A, 0x5F)
@@ -35,20 +38,27 @@ def render_pptx(markdown_text: str, cover: CoverInfo, path: Path, work_dir: Path
 
     _title_slide(prs.slides.add_slide(blank), cover)
 
-    for section in split_sections(parse(markdown_text)):
+    for section in _ordered_sections(parse(markdown_text)):
         title = section["title"] or cover.title
         bullets: list[tuple[str, int]] = []  # (texto, nivel)
+        photo = next(
+            (p for b in section["blocks"] if b["type"] == "image"
+             for p in [fetch_photo(b["query"], work_dir, "portrait")] if p),
+            None,
+        )
 
         def flush():
-            for chunk in _chunk_bullets(bullets):
-                _bullet_slide(prs.slides.add_slide(blank), title, chunk)
+            nonlocal photo
+            for chunk in _chunk_bullets(bullets, narrow=photo is not None):
+                _bullet_slide(prs.slides.add_slide(blank), title, chunk, photo)
+                photo = None  # solo en la primera diapositiva de la sección
             bullets.clear()
 
         for block in section["blocks"]:
             kind = block["type"]
             if kind == "heading":
                 bullets.append((f"**{plain(block['text'])}**", 0))
-            elif kind == "paragraph":
+            elif kind in ("paragraph", "callout"):
                 bullets.append((block["text"], 0))
             elif kind == "list":
                 nested = bool(bullets) and bullets[-1][0].startswith("**")
@@ -68,10 +78,26 @@ def render_pptx(markdown_text: str, cover: CoverInfo, path: Path, work_dir: Path
     return path
 
 
-def _chunk_bullets(bullets: list[tuple[str, int]]) -> list[list[tuple[str, int]]]:
+def _ordered_sections(blocks: list[dict]) -> list[dict]:
+    """Introducción → contenido → Conclusiones → Referencias (las referencias ordenadas alfabéticamente)."""
+    parts = split_document(blocks)
+    sections = []
+    if parts["intro"]:
+        sections.append({"title": "Introducción", "blocks": parts["intro"]})
+    sections += split_sections(parts["body"])
+    if parts["conclusion"]:
+        sections.append({"title": "Conclusiones", "blocks": parts["conclusion"]})
+    if parts["references"]:
+        refs = sorted(reference_entries(parts["references"]), key=lambda t: plain(t).lower())
+        sections.append({"title": "Referencias", "blocks": [{"type": "list", "ordered": False, "items": refs}]})
+    return sections
+
+
+def _chunk_bullets(bullets: list[tuple[str, int]], narrow: bool = False) -> list[list[tuple[str, int]]]:
+    max_chars = MAX_CHARS * 0.6 if narrow else MAX_CHARS
     chunks, current, chars = [], [], 0
     for b in bullets:
-        if current and (len(current) >= MAX_BULLETS or chars + len(b[0]) > MAX_CHARS):
+        if current and (len(current) >= MAX_BULLETS or chars + len(b[0]) > max_chars):
             chunks.append(current)
             current, chars = [], 0
         current.append(b)
@@ -110,8 +136,23 @@ def _title_slide(slide, cover: CoverInfo):
     _text(slide, Inches(0.8), Inches(1.0), Inches(11.5), Inches(0.4), cover.career, 12, color=RGBColor(0xC8, 0xD6, 0xE5))
     tb = _text(slide, Inches(0.8), Inches(1.9), Inches(11.5), Inches(1.6), cover.title, 40, True, WHITE)
     tb.text_frame.vertical_anchor = MSO_ANCHOR.BOTTOM
-    _text(slide, Inches(0.8), Inches(3.8), Inches(11.5), Inches(0.5), cover.course, 18, color=RGBColor(0xC8, 0xD6, 0xE5))
-    _text(slide, Inches(0.8), Inches(6.2), Inches(11.5), Inches(0.4), f"{cover.student}  ·  {cover.date}", 14, color=WHITE)
+
+    # Datos de la portada: licenciatura, materia, grado, alumno, docente, fecha
+    box = slide.shapes.add_textbox(Inches(0.8), Inches(3.9), Inches(11.5), Inches(3.2))
+    tf = box.text_frame
+    tf.word_wrap = True
+    for i, (label, value) in enumerate(f for f in cover.fields() if f[0] != "Licenciatura"):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.space_after = Pt(6)
+        r1 = p.add_run()
+        r1.text = f"{label}: "
+        r1.font.size = Pt(16)
+        r1.font.bold = True
+        r1.font.color.rgb = RGBColor(0xC8, 0xD6, 0xE5)
+        r2 = p.add_run()
+        r2.text = value
+        r2.font.size = Pt(16)
+        r2.font.color.rgb = WHITE
 
 
 def _header(slide, title: str):
@@ -121,12 +162,35 @@ def _header(slide, title: str):
     tb.text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
 
 
-def _bullet_slide(slide, title: str, bullets: list[tuple[str, int]]):
+def _add_picture_fill(slide, path, left, top, width, height):
+    """Inserta la imagen recortada (tipo 'cover') para llenar exactamente el área dada."""
+    with Image.open(path) as im:
+        img_ratio = im.width / im.height
+    box_ratio = width / height
+    pic = slide.shapes.add_picture(str(path), left, top, width, height)
+    if img_ratio > box_ratio:
+        crop = (1 - box_ratio / img_ratio) / 2
+        pic.crop_left = pic.crop_right = crop
+    else:
+        crop = (1 - img_ratio / box_ratio) / 2
+        pic.crop_top = pic.crop_bottom = crop
+    return pic
+
+
+def _bullet_slide(slide, title: str, bullets: list[tuple[str, int]], photo: dict | None = None):
     _header(slide, title)
     total = sum(len(b[0]) for b in bullets)
+    if photo:
+        total = total / 0.6  # menos ancho disponible → letra más chica antes
     size = 22 if total < 300 else 20 if total < 450 else 18 if total < 550 else 16
 
-    tb = slide.shapes.add_textbox(Inches(0.8), Inches(1.6), Inches(11.7), Inches(5.4))
+    text_width = Inches(11.7)
+    if photo:
+        text_width = Inches(7.4)
+        _add_picture_fill(slide, photo["path"], Inches(8.6), Inches(1.26), Inches(4.733), Inches(6.24))
+        _text(slide, Inches(8.7), Inches(7.1), Inches(4.5), Inches(0.3), photo["credit"], 9, color=WHITE)
+
+    tb = slide.shapes.add_textbox(Inches(0.8), Inches(1.6), text_width, Inches(5.4))
     tf = tb.text_frame
     tf.word_wrap = True
     for i, (text, level) in enumerate(bullets):

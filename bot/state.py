@@ -47,6 +47,10 @@ class PendingTask:
     ai_response: str | None = None
     exam_questions: list[ExamQuestion] = field(default_factory=list)
     output_format: str = "docx"  # docx | pptx | pdf | triptico
+    opens_at: str | None = None   # ISO, hora de la UCNL
+    closes_at: str | None = None  # ISO, hora de la UCNL
+    course_grade: str | None = None  # ej. "5to Tetramestre"
+    teacher: str | None = None
 
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
@@ -69,6 +73,10 @@ def _from_row(row) -> PendingTask | None:
         ai_response=row["ai_response"],
         exam_questions=[ExamQuestion(**q) for q in json.loads(row["exam_questions"] or "[]")],
         output_format=row["output_format"],
+        opens_at=row["opens_at"],
+        closes_at=row["closes_at"],
+        course_grade=row["course_grade"],
+        teacher=row["teacher"],
     )
 
 
@@ -119,16 +127,22 @@ def add_task(
     ai_response: str | None = None,
     exam_questions: list[ExamQuestion] | None = None,
     output_format: str = "docx",
+    opens_at: str | None = None,
+    closes_at: str | None = None,
+    course_grade: str | None = None,
+    teacher: str | None = None,
 ) -> PendingTask:
     task_id = str(uuid.uuid4())[:8]
     db.execute(
         "INSERT INTO tasks (id, user_id, course_name, task_title, task_description, task_type, task_url, "
-        "status, created_at, due_date, available_from, ai_response, exam_questions, output_format) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "status, created_at, due_date, available_from, ai_response, exam_questions, output_format, "
+        "opens_at, closes_at, course_grade, teacher) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id, user_id, course_name, task_title, task_description, task_type, task_url, status,
             datetime.now().isoformat(), due_date, available_from, ai_response,
             json.dumps([asdict(q) for q in exam_questions or []], ensure_ascii=False), output_format,
+            opens_at, closes_at, course_grade, teacher,
         ),
     )
     return get_task(task_id)
@@ -178,6 +192,35 @@ def update_exam_questions(task_id: str, questions: list[ExamQuestion], descripti
         status="pending_approval",
         available_from=None,
     )
+
+
+def delete_tasks_outside_courses(user_id: int, current_courses: list[str]) -> int:
+    """Borra las tareas de materias que ya no aparecen en 'Mis cursos' (p. ej. tetramestres pasados)."""
+    if not current_courses:
+        return 0
+    placeholders = ",".join("?" for _ in current_courses)
+    cur = db.execute(
+        f"DELETE FROM tasks WHERE user_id = ? AND status != 'approved' AND course_name NOT IN ({placeholders})",
+        (user_id, *current_courses),
+    )
+    return cur.rowcount
+
+
+def find_existing(user_id: int, course_name: str, task_title: str, task_url: str = "") -> PendingTask | None:
+    row = db.query_one(
+        "SELECT * FROM tasks WHERE user_id = ? AND ((? != '' AND task_url = ?) OR (course_name = ? AND task_title = ?))",
+        (user_id, task_url, task_url, course_name, task_title),
+    )
+    return _from_row(row)
+
+
+def update_course_info(task_id: str, course_grade: str | None, teacher: str | None) -> bool:
+    fields = {k: v for k, v in {"course_grade": course_grade, "teacher": teacher}.items() if v}
+    return _update(task_id, **fields) if fields else False
+
+
+def update_dates(task_id: str, opens_at: str | None, closes_at: str | None) -> bool:
+    return _update(task_id, opens_at=opens_at, closes_at=closes_at)
 
 
 def is_duplicate(user_id: int, course_name: str, task_title: str, task_url: str = "") -> bool:

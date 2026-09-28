@@ -19,11 +19,19 @@ from .logger import logger
 from .users import User
 
 try:
-    from playwright_stealth import stealth_async
+    from playwright_stealth import Stealth  # v2
+
+    async def stealth_async(page):
+        await Stealth().apply_stealth_async(page)
+
     _STEALTH_AVAILABLE = True
 except ImportError:
-    _STEALTH_AVAILABLE = False
-    logger.warning("playwright-stealth no disponible — instalalo con: pip install playwright-stealth")
+    try:
+        from playwright_stealth import stealth_async  # v1
+        _STEALTH_AVAILABLE = True
+    except ImportError:
+        _STEALTH_AVAILABLE = False
+        logger.warning("playwright-stealth no disponible — instalalo con: pip install playwright-stealth")
 
 
 # ─── SELECTORS — Actualizar según la estructura real del sitio ───────────────
@@ -184,6 +192,13 @@ async def get_courses(page: Page) -> list[dict]:
         logger.error(f"Error navegando a Mis Cursos: {e}")
         return []
 
+    # Moodle carga la lista de cursos por AJAX después del evento "load"
+    try:
+        await page.wait_for_selector(SEL_COURSE_LINKS, timeout=20000)
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        logger.warning("La lista de cursos no terminó de cargar a tiempo")
+
     course_links = await page.query_selector_all(SEL_COURSE_LINKS)
     courses = []
     seen_urls = set()
@@ -194,18 +209,50 @@ async def get_courses(page: Page) -> list[dict]:
         # Extraer texto ignorando imágenes y etiquetas genéricas
         name = await link.evaluate("""el => {
             const clone = el.cloneNode(true);
-            clone.querySelectorAll('img').forEach(i => i.remove());
+            clone.querySelectorAll('img, .sr-only, .visually-hidden').forEach(i => i.remove());
             const lines = clone.innerText.split('\\n')
                 .map(l => l.trim())
                 .filter(l => l && l !== 'Imagen del curso' && l !== 'Nombre del curso');
-            return lines.join(' ').trim();
+            return lines.join(' ').replace(/^El curso está destacado\\s*/, '').trim();
         }""")
         if name:
             seen_urls.add(href)
-            courses.append({"name": name, "url": href})
-            logger.info(f"Curso encontrado: {name}")
+            # Grado: categoría del curso en la tarjeta (ej. "5to Tetramestre")
+            grade = await link.evaluate("""el => {
+                const card = el.closest("[data-region='course-content']");
+                const cat = card && card.querySelector('.categoryname');
+                return cat ? cat.innerText.replace('Categoría del curso', '').trim() : '';
+            }""")
+            courses.append({"name": name, "url": href, "grade": grade, "teacher": ""})
+            logger.info(f"Curso encontrado: {name} ({grade or 'sin grado'})")
 
     return courses
+
+
+async def get_course_teacher(page: Page, course: dict) -> str:
+    """Nombre del (los) profesor(es) del curso, desde la lista de participantes."""
+    import re
+    m = re.search(r"[?&]id=(\d+)", course["url"])
+    if not m:
+        return ""
+    base_url = get()["ucnl"]["base_url"].rstrip("/")
+    try:
+        await page.goto(f"{base_url}/user/index.php?id={m.group(1)}&perpage=5000", wait_until="load")
+        names = await page.evaluate("""() => {
+            const out = [];
+            for (const row of document.querySelectorAll('table#participants tbody tr')) {
+                const cells = [...row.querySelectorAll('td, th')].map(c => c.innerText.trim());
+                if (cells.some(c => c === 'Profesor')) {
+                    const name = cells.find(c => c && !c.startsWith('Seleccionar'));
+                    if (name && !out.includes(name)) out.push(name);
+                }
+            }
+            return out;
+        }""")
+        return ", ".join(names)
+    except Exception as e:
+        logger.warning(f"No se pudo obtener el profesor de {course['name']}: {e}")
+        return ""
 
 
 async def get_course_activities(page: Page, course: dict) -> list[dict]:
@@ -236,7 +283,12 @@ async def get_course_activities(page: Page, course: dict) -> list[dict]:
             if not link:
                 continue
 
-            title = (await link.inner_text()).strip()
+            # Moodle agrega el tipo ("Tarea", "Examen") en un span oculto dentro del nombre
+            title = (await link.evaluate("""el => {
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('.accesshide, .sr-only, .visually-hidden').forEach(e => e.remove());
+                return clone.innerText;
+            }""")).strip().split("\n")[0].strip()
             href = await link.get_attribute("href")
             if title and href:
                 activities.append({
@@ -244,12 +296,31 @@ async def get_course_activities(page: Page, course: dict) -> list[dict]:
                     "url": href,
                     "type": activity_type,
                     "course": course["name"],
+                    "course_grade": course.get("grade", ""),
+                    "teacher": course.get("teacher", ""),
                 })
         except Exception:
             continue
 
     logger.info(f"Curso '{course['name']}': {len(activities)} actividades encontradas")
     return activities
+
+
+async def _get_activity_dates(page: Page) -> dict:
+    """Lee el bloque 'Abre: … / Cierra: …' de una actividad (Moodle 4)."""
+    from .dates import classify_dates
+    rows = []
+    for div in await page.query_selector_all("[data-region='activity-dates'] div:has(> strong), .activity-dates div:has(> strong)"):
+        try:
+            strong = await div.query_selector("strong")
+            if not strong:
+                continue
+            label = (await strong.inner_text()).strip()
+            full = (await div.inner_text()).strip()
+            rows.append((label, full[len(label):].strip() if full.startswith(label) else full))
+        except Exception:
+            continue
+    return classify_dates(rows)
 
 
 async def get_assignment_details(page: Page, activity: dict) -> dict | None:
@@ -305,6 +376,7 @@ async def get_assignment_details(page: Page, activity: dict) -> dict | None:
         "already_submitted": already_submitted,
         "is_past_due": is_past_due,
         "due_date": due_date,
+        **await _get_activity_dates(page),
     }
 
 
@@ -385,13 +457,16 @@ async def get_quiz_details(page: Page, activity: dict) -> dict:
     Returns: {already_completed, available_from, questions=None}
     questions is always None; answering happens in real-time during submit_quiz.
     """
-    result = {"already_completed": False, "available_from": None, "questions": None}
+    result = {"already_completed": False, "available_from": None, "questions": None,
+              "opens_at": None, "closes_at": None}
 
     try:
         await page.goto(activity["url"], wait_until="load")
     except Exception as e:
         logger.error(f"Error entrando a examen {activity['title']}: {e}")
         return result
+
+    result.update(await _get_activity_dates(page))
 
     page_text = (await page.inner_text("body")).lower()
 
@@ -423,8 +498,7 @@ async def get_quiz_details(page: Page, activity: dict) -> dict:
         return result
 
     if any(s in page_text for s in ["no disponible", "no está disponible", "este cuestionario no estará disponible"]):
-        available_el = await page.query_selector(".quizinfo, .alert, .generalbox")
-        result["available_from"] = (await available_el.inner_text()).strip() if available_el else "Fecha no disponible"
+        result["available_from"] = result["opens_at"] or "no disponible"
         return result
 
     logger.info(f"Examen '{activity['title']}' disponible — se responderá en tiempo real al aprobar")
@@ -440,6 +514,8 @@ async def submit_assignment(
     course_name: str = "",
     task_title: str = "",
     output_format: str = "docx",
+    course_grade: str = "",
+    teacher: str = "",
 ) -> bool:
     """Generate the document in the chosen format and upload it to the Moodle assignment."""
     from .renderers import build_document
@@ -450,6 +526,9 @@ async def submit_assignment(
         task_title=task_title or task_url,
         student_name=user.display_name,
         output_dir=user.docs_dir,
+        career=user.career,
+        grade=course_grade,
+        teacher=teacher,
     )
     try:
         doc_path = await build_document(output_format, **doc_args)
@@ -659,24 +738,27 @@ async def submit_quiz(user: User, task_url: str, course_name: str = "") -> bool:
 
 # ─── Main scan entry point ────────────────────────────────────────────────────
 
-async def run_scan(user: User) -> list[dict]:
+async def run_scan(user: User) -> dict:
     """
     Full scan: login → get courses → check activities → return raw data.
     State updates are handled by the caller (main.py).
-    Returns list of {course, activity, details} dicts for NEW pending items.
+    Returns {"courses": [nombres] | None, "items": [{course, activity, details|quiz}]}.
+    "courses" es None si el escaneo no terminó bien (para no borrar nada por error).
     """
+    failed = {"courses": None, "items": []}
     async with browser_session(user) as (context, page):
         try:
             if not await _login(page, context, user):
-                return []
+                return failed
 
             courses = await get_courses(page)
             if not courses:
                 logger.warning("No se encontraron cursos")
-                return []
+                return failed
 
             results = []
             for course in courses:
+                course["teacher"] = await get_course_teacher(page, course)
                 activities = await get_course_activities(page, course)
                 for activity in activities:
                     if activity["type"] == "assignment":
@@ -696,11 +778,11 @@ async def run_scan(user: User) -> list[dict]:
                         })
                 await asyncio.sleep(1)
 
-            return results
+            return {"courses": [c["name"] for c in courses], "items": results}
 
         except Exception as e:
             logger.error(f"[{user.username}] Error durante el escaneo: {e}")
-            return []
+            return failed
 
 
 async def scan_debug() -> None:

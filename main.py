@@ -18,7 +18,8 @@ from bot import users
 from bot.security import check_secret_key
 from bot.ai import generate_assignment_response
 from bot.browser import run_scan, submit_assignment, submit_quiz, browser_session, _login
-from bot.renderers import FORMATS, detect_format, build_document
+from bot.renderers import FORMATS, detect_format, build_document, to_pdf_for_preview
+from bot.dates import status_from_dates
 
 SESSION_COOKIE = "ucnl_session"
 
@@ -41,88 +42,138 @@ async def do_scan(user_id: int):
     _scans_running.add(user_id)
     logger.info(f"[{user.username}] Iniciando escaneo de tareas...")
     try:
-        raw_items = await run_scan(user)
+        scan = await run_scan(user)
         new_count = 0
 
-        for item in raw_items:
-            activity = item["activity"]
-            course_name = activity["course"]
-            task_title = activity["title"]
-            task_url = activity["url"]
+        for item in scan["items"]:
+            try:
+                if await _register_item(user, item):
+                    new_count += 1
+            except Exception as e:
+                # Un error en una actividad no debe tirar el resto del escaneo
+                logger.error(f"[{user.username}] Error registrando '{item['activity']['title']}': {e}")
 
-            if st.is_duplicate(user_id, course_name, task_title, task_url):
-                logger.info(f"[{user.username}] Ya registrada: {task_title}")
-                continue
-
-            if activity["type"] == "assignment":
-                details = item["details"]
-                description = details["description"]
-                already_submitted = details.get("already_submitted", False)
-                is_past_due = details.get("is_past_due", False)
-                due_date = details.get("due_date")
-
-                output_format = detect_format(task_title, description)
-                if already_submitted:
-                    status = "done"
-                    ai_response = None
-                elif is_past_due:
-                    status = "expired"
-                    ai_response = None
-                else:
-                    status = "pending_approval"
-                    ai_response = await run_in_threadpool(
-                        generate_assignment_response, course_name, task_title, description, output_format
-                    )
-
-                st.add_task(
-                    user_id=user_id,
-                    course_name=course_name,
-                    task_title=task_title,
-                    task_description=description,
-                    task_type="assignment",
-                    task_url=task_url,
-                    status=status,
-                    due_date=due_date,
-                    ai_response=ai_response,
-                    output_format=output_format,
-                )
-                new_count += 1
-                logger.info(f"[{user.username}] Tarea registrada [{status}] ({output_format}): {task_title}")
-
-            elif activity["type"] == "quiz":
-                quiz = item["quiz"]
-                already_completed = quiz.get("already_completed", False)
-                available_from = quiz.get("available_from")
-
-                if already_completed:
-                    status = "done"
-                    description = "Examen ya completado"
-                elif available_from:
-                    status = "future"
-                    description = f"Disponible: {available_from}"
-                else:
-                    # Examen disponible — el bot responderá en tiempo real al aprobar
-                    status = "pending_approval"
-                    description = "Examen disponible — el bot responderá cada pregunta en tiempo real al aprobar"
-
-                st.add_task(
-                    user_id=user_id,
-                    course_name=course_name,
-                    task_title=task_title,
-                    task_description=description,
-                    task_type="exam",
-                    task_url=task_url,
-                    status=status,
-                    available_from=available_from,
-                )
-                new_count += 1
-                logger.info(f"[{user.username}] Examen registrado [{status}]: {task_title}")
+        if scan["courses"]:
+            removed = st.delete_tasks_outside_courses(user_id, scan["courses"])
+            if removed:
+                logger.info(f"[{user.username}] {removed} tareas de materias anteriores eliminadas")
 
         logger.info(f"[{user.username}] Escaneo completado — {new_count} nuevas tareas")
     except Exception as e:
         logger.error(f"[{user.username}] Error en escaneo: {e}")
     finally:
         _scans_running.discard(user_id)
+
+
+def _compute_status(kind: str, data: dict) -> str:
+    """Estado de una actividad según lo que se vio en UCNL y sus fechas de apertura/cierre."""
+    if kind == "assignment":
+        if data.get("already_submitted"):
+            return "done"
+        status = status_from_dates(data.get("opens_at"), data.get("closes_at"))
+        if status == "pending_approval" and data.get("is_past_due"):
+            return "expired"
+        return status
+
+    if data.get("already_completed"):
+        return "done"
+    status = status_from_dates(data.get("opens_at"), data.get("closes_at"))
+    if status == "pending_approval" and data.get("available_from"):
+        return "future"  # Moodle dice "no disponible" aunque no tengamos la fecha
+    return status
+
+
+# Estados que un escaneo puede recalcular (los demás son decisiones o resultados definitivos)
+_REFRESHABLE = {"future", "pending_approval", "expired"}
+
+_QUIZ_DESCRIPTIONS = {
+    "done": "Examen ya completado",
+    "future": "Aún no abre",
+    "expired": "Ya cerró",
+    "pending_approval": "Examen disponible — el bot responderá cada pregunta en tiempo real al aprobar",
+}
+
+
+async def _register_item(user: users.User, item: dict) -> bool:
+    """Registra una actividad escaneada o actualiza sus fechas/estado. Devuelve True si era nueva."""
+    activity = item["activity"]
+    course_name = activity["course"]
+    task_title = activity["title"]
+    task_url = activity["url"]
+    kind = activity["type"]
+    if kind not in ("assignment", "quiz"):
+        return False
+
+    data = item["details"] if kind == "assignment" else item["quiz"]
+    status = _compute_status(kind, data)
+    opens_at, closes_at = data.get("opens_at"), data.get("closes_at")
+
+    course_grade, teacher = activity.get("course_grade", ""), activity.get("teacher", "")
+
+    existing = st.find_existing(user.id, course_name, task_title, task_url)
+    if existing:
+        st.update_dates(existing.id, opens_at, closes_at)
+        st.update_course_info(existing.id, course_grade, teacher)
+        if existing.status in _REFRESHABLE and existing.status != status:
+            st.update_status(existing.id, status)
+            if kind == "quiz":
+                st.update_description(existing.id, _QUIZ_DESCRIPTIONS[status])
+            logger.info(f"[{user.username}] '{task_title}': {existing.status} → {status}")
+        if (kind == "assignment" and status in ("pending_approval", "future")
+                and not (existing.ai_response or "").strip()):
+            await _generate_response(user, existing.id, course_name, task_title, existing.task_description, existing.output_format)
+        return False
+
+    if kind == "assignment":
+        description = data["description"]
+        output_format = detect_format(task_title, description)
+        task = st.add_task(
+            user_id=user.id,
+            course_name=course_name,
+            task_title=task_title,
+            task_description=description,
+            task_type="assignment",
+            task_url=task_url,
+            status=status,
+            due_date=data.get("due_date"),
+            output_format=output_format,
+            opens_at=opens_at,
+            closes_at=closes_at,
+            course_grade=course_grade,
+            teacher=teacher,
+        )
+        # Se genera también para las que aún no abren, así ya están listas para revisar
+        if status in ("pending_approval", "future"):
+            await _generate_response(user, task.id, course_name, task_title, description, output_format)
+        logger.info(f"[{user.username}] Tarea registrada [{status}] ({output_format}): {task_title}")
+        return True
+
+    st.add_task(
+        user_id=user.id,
+        course_name=course_name,
+        task_title=task_title,
+        task_description=_QUIZ_DESCRIPTIONS[status],
+        task_type="exam",
+        task_url=task_url,
+        status=status,
+        opens_at=opens_at,
+        closes_at=closes_at,
+        course_grade=course_grade,
+        teacher=teacher,
+    )
+    logger.info(f"[{user.username}] Examen registrado [{status}]: {task_title}")
+    return True
+
+
+async def _generate_response(user, task_id, course_name, task_title, description, output_format):
+    try:
+        response = await run_in_threadpool(
+            generate_assignment_response, course_name, task_title, description, output_format
+        )
+        st.update_response(task_id, response)
+    except Exception as e:
+        # Se queda vacía; desde el panel se puede usar "Regenerar"
+        logger.error(f"[{user.username}] No se pudo generar la respuesta de '{task_title}': {e}")
 
 
 def schedule_user_scan(user: users.User):
@@ -215,6 +266,7 @@ def _user_to_dict(user: users.User) -> dict:
     return {
         "username": user.username,
         "display_name": user.display_name,
+        "career": user.career,
         "ucnl_username": user.ucnl_username,
         "has_ucnl_password": bool(user.ucnl_password_enc),
         "scan_hour": user.scan_hour,
@@ -224,6 +276,7 @@ def _user_to_dict(user: users.User) -> dict:
 
 class ProfileRequest(BaseModel):
     display_name: str | None = Field(None, min_length=1, max_length=120)
+    career: str | None = Field(None, min_length=1, max_length=160)
     ucnl_username: str | None = Field(None, max_length=120)
     ucnl_password: str | None = Field(None, max_length=200)
     scan_hour: int | None = Field(None, ge=0, le=23)
@@ -246,6 +299,7 @@ def update_me(body: ProfileRequest, user: users.User = Depends(current_user)):
     updated = users.update_profile(
         user.id,
         display_name=body.display_name,
+        career=body.career,
         ucnl_username=body.ucnl_username,
         ucnl_password=body.ucnl_password or None,
         scan_hour=body.scan_hour,
@@ -268,6 +322,7 @@ class ApproveRequest(BaseModel):
 class DocumentRequest(BaseModel):
     text: str | None = None
     output_format: str | None = None
+    view: bool = False  # True: devolver PDF para verlo en el panel (convierte Word/PowerPoint si se puede)
 
 
 def _validate_format(output_format: str | None) -> None:
@@ -300,12 +355,22 @@ async def approve_task(
     task = _own_task(task_id, user)
     if task.status != "pending_approval":
         raise HTTPException(status_code=400, detail=f"La tarea ya está en estado: {task.status}")
+    window = status_from_dates(task.opens_at, task.closes_at)
+    if window != "pending_approval":
+        st.update_status(task_id, window)
+        raise HTTPException(
+            status_code=400,
+            detail="Esta actividad todavía no abre" if window == "future" else "Esta actividad ya cerró",
+        )
 
     _validate_format(body.output_format)
     if body.edited_response and task.task_type == "assignment":
         st.update_response(task_id, body.edited_response)
     if body.output_format and task.task_type == "assignment":
         st.update_format(task_id, body.output_format)
+
+    if task.task_type == "assignment" and not (body.edited_response or task.ai_response or "").strip():
+        raise HTTPException(status_code=400, detail="La respuesta está vacía — usa 'Regenerar' o escríbela")
 
     st.update_status(task_id, "approved")
     background_tasks.add_task(_submit_task, task_id)
@@ -327,11 +392,20 @@ async def preview_document(task_id: str, body: DocumentRequest, user: users.User
             task_title=task.task_title,
             student_name=user.display_name,
             output_dir=user.docs_dir / "previews",
+            career=user.career,
+            grade=task.course_grade or "",
+            teacher=task.teacher or "",
         )
     except Exception as e:
         logger.error(f"Error generando vista previa de {task_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error generando documento: {e}")
-    return FileResponse(path, filename=path.name)
+    if body.view and path.suffix != ".pdf":
+        pdf = await to_pdf_for_preview(path)
+        if pdf:
+            return FileResponse(pdf, filename=pdf.name, content_disposition_type="inline")
+    # Los PDF se muestran en el navegador; Word/PowerPoint se descargan
+    disposition = "inline" if path.suffix == ".pdf" else "attachment"
+    return FileResponse(path, filename=path.name, content_disposition_type=disposition)
 
 
 @app.post("/api/regenerate/{task_id}")
@@ -367,6 +441,8 @@ async def attempt_task(task_id: str, background_tasks: BackgroundTasks, user: us
         raise HTTPException(status_code=400, detail="Solo aplica para exámenes")
     if task.status not in ("future", "failed", "rejected", "expired"):
         raise HTTPException(status_code=400, detail=f"No se puede intentar en estado: {task.status}")
+    if status_from_dates(task.opens_at, None) == "future":
+        raise HTTPException(status_code=400, detail="Este examen todavía no abre")
     background_tasks.add_task(_fetch_and_analyze_quiz, task_id)
     return {"status": "attempt_started", "task_id": task_id}
 
@@ -385,6 +461,7 @@ async def _fetch_and_analyze_quiz(task_id: str):
                 st.update_status(task_id, "failed")
                 return
             quiz = await get_quiz_details(page, activity)
+        st.update_dates(task_id, quiz.get("opens_at"), quiz.get("closes_at"))
 
         if quiz.get("already_completed"):
             grade = quiz.get("grade", "")
@@ -392,9 +469,11 @@ async def _fetch_and_analyze_quiz(task_id: str):
             st.update_description(task_id, desc)
             st.update_status(task_id, "done")
             logger.info(f"Examen {task_id} completado. {desc}")
-        elif quiz.get("available_from"):
-            st.update_status(task_id, "future")
-            logger.info(f"Examen {task_id} aún no disponible: {quiz['available_from']}")
+        elif _compute_status("quiz", quiz) != "pending_approval":
+            new_status = _compute_status("quiz", quiz)
+            st.update_status(task_id, new_status)
+            st.update_description(task_id, _QUIZ_DESCRIPTIONS[new_status])
+            logger.info(f"Examen {task_id} no disponible: {new_status}")
         else:
             description = "Examen disponible — el bot responderá cada pregunta en tiempo real al aprobar"
             st.update_exam_questions(task_id, [], description)
@@ -443,6 +522,8 @@ async def _submit_task(task_id: str):
                 course_name=task.course_name,
                 task_title=task.task_title,
                 output_format=task.output_format,
+                course_grade=task.course_grade or "",
+                teacher=task.teacher or "",
             )
         else:
             ok = await submit_quiz(user, task.task_url, course_name=task.course_name)
@@ -477,6 +558,10 @@ def _task_to_dict(task: st.PendingTask) -> dict:
         "available_from": task.available_from,
         "ai_response": task.ai_response,
         "output_format": task.output_format,
+        "course_grade": task.course_grade,
+        "teacher": task.teacher,
+        "opens_at": task.opens_at,
+        "closes_at": task.closes_at,
         "exam_questions": [
             {
                 "question": q.question,
@@ -583,6 +668,10 @@ def _render_ui() -> str:
         <input id="s-display" required class="w-full border rounded px-3 py-2 text-sm mt-1">
       </label>
       <label class="block">
+        <span class="text-xs font-semibold text-gray-500">LICENCIATURA (aparece en las portadas)</span>
+        <input id="s-career" required class="w-full border rounded px-3 py-2 text-sm mt-1">
+      </label>
+      <label class="block">
         <span class="text-xs font-semibold text-gray-500">HORA DEL ESCANEO DIARIO</span>
         <input id="s-time" type="time" required class="w-full border rounded px-3 py-2 text-sm mt-1">
       </label>
@@ -627,9 +716,14 @@ window.fetch = async (...args) => {
   return r;
 };
 
+let _wasScanning = false;
+
 async function loadStatus() {
   const r = await fetch('/api/status');
   const data = await r.json();
+  // Al terminar un escaneo, recargar la lista para no mostrar datos a medias
+  if (_wasScanning && !data.scan_running) loadTasks();
+  _wasScanning = data.scan_running;
   document.getElementById('user-name').textContent = data.display_name;
   document.getElementById('creds-banner').classList.toggle('hidden', data.has_ucnl_credentials);
   const badge = document.getElementById('status-badge');
@@ -651,6 +745,9 @@ async function loadTasks() {
     return;
   }
 
+  // Ordenar por fecha de cierre (las que cierran antes primero; sin fecha al final)
+  tasks.sort((a, b) => (a.closes_at || '9999').localeCompare(b.closes_at || '9999'));
+
   // Group by course
   const courses = {};
   for (const t of tasks) {
@@ -668,6 +765,7 @@ async function loadTasks() {
         <button onclick="toggleCourse(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-50 transition-colors">
           <div class="flex items-center gap-2">
             <span class="text-base font-semibold text-gray-800">${course}</span>
+            ${items[0].course_grade || items[0].teacher ? `<span class="text-xs text-gray-500">${[items[0].course_grade, items[0].teacher].filter(Boolean).join(' · ')}</span>` : ''}
             ${badge}
           </div>
           <div class="flex items-center gap-3">
@@ -683,6 +781,36 @@ async function loadTasks() {
       </div>
     `;
   }).join('');
+}
+
+function fmtDate(iso) {
+  return new Date(iso).toLocaleString('es-MX', {
+    weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function relative(iso) {
+  const days = Math.round((new Date(iso) - new Date()) / 86400000);
+  if (days === 0) return 'hoy';
+  if (days === 1) return 'mañana';
+  if (days === -1) return 'ayer';
+  return days > 0 ? `en ${days} días` : `hace ${-days} días`;
+}
+
+function renderDates(t) {
+  const parts = [];
+  const now = new Date();
+  if (t.opens_at && new Date(t.opens_at) > now) {
+    parts.push(`<span class="text-xs text-purple-700">Abre: <strong>${fmtDate(t.opens_at)}</strong> (${relative(t.opens_at)})</span>`);
+  }
+  if (t.closes_at) {
+    const soon = new Date(t.closes_at) - now < 3 * 86400000 && new Date(t.closes_at) > now;
+    parts.push(`<span class="text-xs ${soon ? 'text-red-700' : 'text-gray-600'}">Cierra: <strong>${fmtDate(t.closes_at)}</strong> (${relative(t.closes_at)})</span>`);
+  }
+  if (!parts.length && t.due_date) {
+    parts.push(`<span class="text-xs text-gray-500">Fecha límite: <strong>${t.due_date}</strong></span>`);
+  }
+  return parts.join('');
 }
 
 function toggleCourse(btn) {
@@ -761,21 +889,29 @@ function renderTask(t) {
         </div>
       `;
     }).join('');
-    body = `
+    body = questions ? `
       <div class="mt-3">
         <p class="text-xs font-semibold text-gray-500 mb-2">PREGUNTAS (respuestas marcadas con ✓)</p>
         <div class="bg-gray-50 rounded p-3 max-h-64 overflow-y-auto">${questions}</div>
       </div>
+    ` : `
+      <p class="mt-3 text-sm text-gray-600 bg-gray-50 rounded p-3">${t.task_description}</p>
+      ${t.status === 'pending_approval' ? `
+      <p class="mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+        Al aprobar, el bot abre el examen en UCNL, contesta cada pregunta con IA y <strong>envía el intento</strong>.
+        Cuenta como tu calificación y no se puede deshacer.
+      </p>` : ''}
     `;
   }
 
   const canAct = t.status === 'pending_approval';
-  const canAttempt = t.task_type === 'exam' && ['future', 'failed', 'rejected', 'expired'].includes(t.status);
+  const notOpenYet = t.opens_at && new Date(t.opens_at) > new Date();
+  const canAttempt = t.task_type === 'exam' && !notOpenYet && ['future', 'failed', 'rejected', 'expired'].includes(t.status);
   const actions = canAct ? `
     <div class="mt-4 flex gap-3">
       <button onclick="approve('${t.id}', '${t.task_type}')"
         class="bg-green-600 text-white text-sm px-5 py-2 rounded-lg hover:bg-green-700 font-medium">
-        Aprobar y entregar
+        ${t.task_type === 'exam' ? 'Contestar y enviar examen' : 'Aprobar y entregar'}
       </button>
       <button onclick="reject('${t.id}')"
         class="bg-red-100 text-red-700 text-sm px-5 py-2 rounded-lg hover:bg-red-200 font-medium">
@@ -786,7 +922,7 @@ function renderTask(t) {
     <div class="mt-4 flex gap-3">
       <button onclick="attemptExam('${t.id}')"
         class="bg-purple-600 text-white text-sm px-5 py-2 rounded-lg hover:bg-purple-700 font-medium">
-        Intentar examen ahora
+        Volver a verificar examen
       </button>
     </div>
   ` : '';
@@ -797,15 +933,14 @@ function renderTask(t) {
         <div>
           <div class="flex items-center gap-2 mb-1">
             <span class="text-xs px-2 py-0.5 rounded ${typeColor[t.task_type] || 'bg-gray-100 text-gray-600'}">${typeLabel[t.task_type] || t.task_type}</span>
-            <span class="text-xs text-gray-400">${t.created_at}</span>
+            <span class="text-xs text-gray-400" title="Registrada por el bot">${t.created_at}</span>
           </div>
           <h3 class="text-sm font-semibold text-gray-900">${t.task_title}</h3>
           <div class="flex flex-wrap items-center gap-2 mt-1">
             <span class="text-xs px-2 py-0.5 rounded-full border ${color}">
               ${statusLabel[t.status] || t.status}
             </span>
-            ${t.due_date ? `<span class="text-xs text-gray-500">Fecha límite: <strong>${t.due_date}</strong></span>` : ''}
-            ${t.available_from ? `<span class="text-xs text-purple-600">Disponible: ${t.available_from}</span>` : ''}
+            ${renderDates(t)}
           </div>
         </div>
         <a href="${t.task_url}" target="_blank" class="text-xs text-blue-600 hover:underline shrink-0">Ver en UCNL ↗</a>
@@ -817,6 +952,7 @@ function renderTask(t) {
 }
 
 async function approve(taskId, type) {
+  if (type === 'exam' && !confirm('El bot va a contestar y ENVIAR este examen en UCNL. Cuenta como tu calificación y no se puede deshacer. ¿Continuar?')) return;
   let body = {};
   if (type === 'assignment') {
     const ta = document.getElementById(`resp-${taskId}`);
@@ -833,29 +969,72 @@ async function approve(taskId, type) {
   loadStatus();
 }
 
-async function previewDoc(taskId) {
+async function previewDoc(taskId, download = false) {
   const btn = document.getElementById(`prev-${taskId}`);
   const ta = document.getElementById(`resp-${taskId}`);
   const fmt = document.getElementById(`fmt-${taskId}`);
+  const label = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generando...';
   try {
     const r = await fetch(`/api/preview/${taskId}`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ text: ta ? ta.value : null, output_format: fmt ? fmt.value : null }),
+      body: JSON.stringify({
+        text: ta ? ta.value : null,
+        output_format: fmt ? fmt.value : null,
+        view: !download,
+      }),
     });
     if (!r.ok) { alert('Error: ' + (await r.text())); return; }
     const blob = await r.blob();
     const name = (r.headers.get('content-disposition') || '').match(/filename[*]?=(?:UTF-8'')?"?([^";]+)/i);
+    const filename = name ? decodeURIComponent(name[1]) : 'vista_previa';
+    if (!download && blob.type === 'application/pdf') {
+      openPreviewModal(taskId, URL.createObjectURL(blob), fmt ? fmt.options[fmt.selectedIndex].text : '');
+      return;
+    }
+    if (!download) {
+      alert('Para ver Word/PowerPoint aquí mismo instala LibreOffice. Por ahora se descargará el archivo.');
+    }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = name ? decodeURIComponent(name[1]) : 'vista_previa';
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(a.href);
   } finally {
-    btn.disabled = false; btn.textContent = 'Vista previa';
+    btn.disabled = false; btn.textContent = label;
   }
 }
+
+function openPreviewModal(taskId, url, formatName) {
+  closePreviewModal();
+  const modal = document.createElement('div');
+  modal.id = 'preview-modal';
+  modal.className = 'fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4';
+  modal.innerHTML = `
+    <div class="bg-white rounded-xl shadow-xl w-full max-w-5xl h-full flex flex-col overflow-hidden">
+      <div class="flex items-center justify-between gap-3 px-4 py-2 border-b">
+        <p class="text-sm font-semibold text-gray-700">Vista previa — ${formatName}</p>
+        <div class="flex gap-2">
+          <button onclick="previewDoc('${taskId}', true)" class="text-sm bg-gray-100 text-gray-700 px-3 py-1 rounded hover:bg-gray-200">Descargar archivo</button>
+          <button onclick="closePreviewModal()" class="text-sm bg-gray-800 text-white px-3 py-1 rounded hover:bg-gray-700">Cerrar</button>
+        </div>
+      </div>
+      <iframe src="${url}" class="flex-1 w-full" title="Vista previa"></iframe>
+    </div>`;
+  modal.addEventListener('click', (e) => { if (e.target === modal) closePreviewModal(); });
+  modal.dataset.url = url;
+  document.body.appendChild(modal);
+}
+
+function closePreviewModal() {
+  const modal = document.getElementById('preview-modal');
+  if (!modal) return;
+  URL.revokeObjectURL(modal.dataset.url);
+  modal.remove();
+}
+
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePreviewModal(); });
 
 async function regenerate(taskId) {
   const btn = document.getElementById(`regen-${taskId}`);
@@ -897,6 +1076,7 @@ async function triggerScan() {
   const r = await fetch('/api/scan', { method: 'POST' });
   const d = await r.json();
   if (!r.ok) { alert(d.detail); return; }
+  _wasScanning = true;
   alert(d.status === 'scan_started' ? 'Escaneo iniciado. Actualiza en unos minutos.' : 'Ya hay un escaneo en curso.');
   loadStatus();
 }
@@ -908,6 +1088,7 @@ async function toggleSettings(show) {
   if (!visible) return;
   const me = await (await fetch('/api/me')).json();
   document.getElementById('s-display').value = me.display_name;
+  document.getElementById('s-career').value = me.career;
   document.getElementById('s-time').value =
     `${String(me.scan_hour).padStart(2, '0')}:${String(me.scan_minute).padStart(2, '0')}`;
   document.getElementById('s-ucnl-user').value = me.ucnl_username;
@@ -922,6 +1103,7 @@ async function saveSettings(e) {
   const [h, m] = document.getElementById('s-time').value.split(':').map(Number);
   const body = {
     display_name: document.getElementById('s-display').value,
+    career: document.getElementById('s-career').value,
     ucnl_username: document.getElementById('s-ucnl-user').value,
     ucnl_password: document.getElementById('s-ucnl-pass').value || null,
     scan_hour: h,

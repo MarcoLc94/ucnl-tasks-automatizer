@@ -6,6 +6,8 @@ Soporta:
   - item / 1. item    listas
   | a | b |           tablas (la primera fila es el encabezado)
   ```grafica {json}```  gráficas (ver charts.normalize_chart)
+  > **75%** de …      cifra clave / cita destacada
+  ![descripción](imagen)  foto buscada en Pexels por su descripción
   **negrita** / *cursiva* dentro del texto
 """
 import json
@@ -18,6 +20,7 @@ _BULLET = re.compile(r"^\s*[-*•]\s+(.*)$")
 _NUMBERED = re.compile(r"^\s*\d+[.)]\s+(.*)$")
 _TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 _FENCE = re.compile(r"^\s*```\s*(\w*)\s*$")
+_IMAGE = re.compile(r"^!\[([^\]]+)\]\(([^)]*)\)$")
 _INLINE = re.compile(r"(\*\*[^*]+\*\*|\*[^*]+\*)")
 
 CHART_FENCES = {"grafica", "gráfica", "chart", "grafico", "gráfico", "json"}
@@ -84,6 +87,28 @@ def parse(text: str) -> list[dict]:
             width = len(header)
             rows = [(r + [""] * width)[:width] for r in rows]
             blocks.append({"type": "table", "header": header, "rows": rows})
+            continue
+
+        image = _IMAGE.match(stripped)
+        if image:
+            flush_paragraph()
+            blocks.append({"type": "image", "query": image.group(1).strip()})
+            i += 1
+            continue
+
+        if stripped.startswith(">"):
+            flush_paragraph()
+            # Cada línea que empieza con "> **dato**" es una cifra clave distinta;
+            # las demás líneas ">" continúan la anterior
+            quotes: list[list[str]] = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                text = lines[i].strip().lstrip(">").strip()
+                if text and (not quotes or text.startswith("**")):
+                    quotes.append([text])
+                elif text:
+                    quotes[-1].append(text)
+                i += 1
+            blocks.extend({"type": "callout", "text": " ".join(q)} for q in quotes)
             continue
 
         bullet = _BULLET.match(line)

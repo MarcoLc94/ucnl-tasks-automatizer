@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 from groq import Groq, RateLimitError
@@ -31,6 +32,12 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
     for attempt in range(retries):
         try:
             _last_call_time = time.time()
+            extra = {}
+            if cfg.get("reasoning_effort"):
+                # Los modelos de razonamiento gastan tokens pensando antes de responder:
+                # se les da margen extra para que no corten la respuesta (o la dejen vacía)
+                extra["reasoning_effort"] = cfg["reasoning_effort"]
+                max_tokens += int(cfg.get("reasoning_budget", 4096))
             response = _get_client().chat.completions.create(
                 model=cfg["model"],
                 messages=[
@@ -39,8 +46,11 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
                 ],
                 temperature=cfg["temperature"],
                 max_tokens=max_tokens,
+                **extra,
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content or ""
+            # Algunos modelos incluyen su razonamiento entre <think>…</think>
+            return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
         except RateLimitError:
             if attempt < retries - 1:
                 logger.warning(f"Rate limit de Groq — esperando {wait}s antes de reintentar ({attempt + 1}/{retries})")
@@ -51,29 +61,53 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
                 raise
 
 
+_STRUCTURE = """ESTRUCTURA OBLIGATORIA (en este orden, con estos títulos exactos):
+## Introducción
+  Mínimo 230 palabras en 2 o 3 párrafos de prosa (sin viñetas): contexto del tema, su importancia y
+  qué se abordará en el trabajo.
+{body}
+## Conclusiones
+  Mínimo 180 palabras en 2 párrafos de prosa: síntesis de lo aprendido y reflexión personal.
+## Referencias
+  Lista con "- " de 3 a 6 fichas bibliográficas en formato APA 7 (Autor, A. (Año). *Título*. Editorial o
+  sitio. URL si aplica). Usa SOLO obras, organismos y sitios reales y reconocidos; no inventes autores,
+  títulos ni URLs. Si no estás seguro de una URL, omítela."""
+
 _FORMAT_GUIDE = {
     "docx": (
-        "El resultado será un documento de Word. Redacta un trabajo académico completo: "
-        "introducción, desarrollo en varias secciones con párrafos bien argumentados, y conclusión. "
-        "Agrega referencias al final si aplica.",
-        3500,
+        "El resultado será un trabajo académico en Word.",
+        "## (secciones del contenido)\n  De 3 a 6 secciones '##' con párrafos bien argumentados "
+        "(y '###' si hace falta), respondiendo todo lo que piden las instrucciones.",
+        4500,
     ),
     "pdf": (
-        "El resultado será un reporte en PDF. Redacta un trabajo académico completo: "
-        "introducción, desarrollo en varias secciones con párrafos bien argumentados, y conclusión. "
-        "Agrega referencias al final si aplica.",
-        3500,
+        "El resultado será un trabajo académico en PDF.",
+        "## (secciones del contenido)\n  De 3 a 6 secciones '##' con párrafos bien argumentados "
+        "(y '###' si hace falta), respondiendo todo lo que piden las instrucciones.",
+        4500,
     ),
     "pptx": (
-        "El resultado será una presentación de PowerPoint. Cada sección '##' se convierte en una "
-        "diapositiva: usa entre 6 y 10 secciones, cada una con 3 a 5 viñetas breves (máximo 20 palabras "
-        "cada una). Evita párrafos largos. Termina con una sección de conclusiones.",
-        2500,
+        "El resultado será una presentación de PowerPoint: cada sección '##' se convierte en diapositivas.",
+        "## (secciones del contenido)\n  De 5 a 8 secciones '##', cada una con 3 a 5 viñetas breves "
+        "(máximo 20 palabras cada una), sin párrafos largos.",
+        4000,
+    ),
+    "infografia": (
+        "El resultado será un Word cuyo contenido principal es una INFOGRAFÍA de una página (cartel) "
+        "muy visual y con poco texto. El tema es el de la actividad: no hables de las herramientas para "
+        "hacerla (Canva, Piktochart, etc.) ni de las instrucciones de entrega.",
+        "## (secciones de la infografía)\n  De 4 a 6 secciones '##'; cada título empieza con un emoji "
+        "relacionado (ej. '## 🌱 Energías limpias'). Cada una con máximo 3 viñetas de 12 palabras o "
+        "menos. Incluye 2 o 3 cifras clave con el formato '> **cifra** explicación breve' SOLO si son "
+        "datos reales y conocidos (nunca inventes cifras) y, si hay datos reales comparables, UNA "
+        "gráfica. Máximo 220 palabras en esta parte.",
+        4000,
     ),
     "triptico": (
         "El resultado será un tríptico (folleto de 6 paneles). Usa de 5 a 7 secciones '##' cortas y "
         "llamativas, con frases concisas y viñetas. En total no más de 450 palabras. La última sección "
         "debe ser un cierre (conclusión, datos clave o recomendaciones).",
+        None,
         2000,
     ),
 }
@@ -82,6 +116,7 @@ _MARKDOWN_RULES = """Escribe la respuesta en Markdown usando SOLO estos elemento
 - "## Título de sección" y "### Subtítulo"
 - Párrafos normales, **negritas** y *cursivas*
 - Listas con "- " o "1. "
+- Cifras o frases destacadas con "> **dato** explicación"
 - Tablas Markdown (| col | col | con fila separadora |---|---|) cuando comparar información ayude
 - Gráficas, SOLO si la tarea lo pide o si hay datos reales y conocidos que graficar (nunca inventes estadísticas), con este bloque exacto:
 ```grafica
@@ -92,20 +127,40 @@ No incluyas portada, nombre del alumno, fecha ni el título de la tarea: eso se 
 No uses ningún otro tipo de bloque de código."""
 
 
+_IMAGE_RULE_BASE = (
+    "Puedes incluir fotos con una línea propia así: ![descripción concreta de la foto](imagen). "
+    "La descripción se usa para buscar una foto de stock: describe algo fotografiable y concreto "
+    "(ej. 'paneles solares en un techo', 'personas reciclando plástico'), nunca diagramas, gráficas, "
+    "logotipos ni texto. "
+)
+_IMAGE_RULES = {
+    "docx": _IMAGE_RULE_BASE + "Usa 1 o 2 fotos en total, dentro de las secciones del contenido.",
+    "pdf": _IMAGE_RULE_BASE + "Usa 1 o 2 fotos en total, dentro de las secciones del contenido.",
+    "pptx": _IMAGE_RULE_BASE + "Pon una foto en 3 o 4 de las secciones (al inicio de la sección).",
+    "triptico": _IMAGE_RULE_BASE + "Usa 1 o 2 fotos en total.",
+    "infografia": _IMAGE_RULE_BASE + "Usa exactamente 1 foto (será el fondo del encabezado de la infografía), al inicio de la primera sección de la infografía.",
+}
+
+
 def generate_assignment_response(
     course_name: str,
     task_title: str,
     task_description: str,
     output_format: str = "docx",
 ) -> str:
-    guide, max_tokens = _FORMAT_GUIDE.get(output_format, _FORMAT_GUIDE["docx"])
+    guide, body, max_tokens = _FORMAT_GUIDE.get(output_format, _FORMAT_GUIDE["docx"])
+    if body:  # Trabajos con portada/introducción/contenido/conclusiones/referencias
+        guide = f"{guide}\n\n{_STRUCTURE.format(body=body)}"
+    from .images import enabled as images_enabled
+    image_rule = _IMAGE_RULES.get(output_format, "") if images_enabled() else ""
     system = f"""Eres un estudiante universitario aplicado de la Universidad Ciudadana de Nuevo León (UCNL)
 cursando Ingeniería en Desarrollo de Software. Debes redactar respuestas académicas completas,
 bien estructuradas y en español. Usa un tono formal pero claro.
 
 {guide}
 
-{_MARKDOWN_RULES}"""
+{_MARKDOWN_RULES}
+{image_rule}"""
 
     user = f"""Materia: {course_name}
 Tarea: {task_title}

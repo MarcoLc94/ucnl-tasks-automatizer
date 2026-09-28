@@ -13,6 +13,7 @@ class User:
     id: int
     username: str
     display_name: str
+    career: str
     ucnl_username: str
     ucnl_password_enc: str
     scan_hour: int
@@ -48,6 +49,7 @@ def _from_row(row) -> User | None:
         id=row["id"],
         username=row["username"],
         display_name=row["display_name"],
+        career=row["career"],
         ucnl_username=row["ucnl_username"],
         ucnl_password_enc=row["ucnl_password_enc"],
         scan_hour=row["scan_hour"],
@@ -96,6 +98,7 @@ def set_password(user_id: int, password: str) -> None:
 def update_profile(
     user_id: int,
     display_name: str | None = None,
+    career: str | None = None,
     ucnl_username: str | None = None,
     ucnl_password: str | None = None,
     scan_hour: int | None = None,
@@ -103,6 +106,7 @@ def update_profile(
 ) -> User:
     fields = {
         "display_name": display_name,
+        "career": career,
         "ucnl_username": ucnl_username,
         "ucnl_password_enc": encrypt(ucnl_password) if ucnl_password else None,
         "scan_hour": scan_hour,

@@ -1,12 +1,16 @@
 bot:
-  model: "llama-3.3-70b-versatile"
+  model: "openai/gpt-oss-120b"
   temperature: 0.5
   max_tokens: 2000
+  # Para modelos de razonamiento (gpt-oss, qwen3): low | medium | high
+  reasoning_effort: "medium"
+  # Tokens extra que se reservan para el razonamiento además de la respuesta
+  reasoning_budget: 4096
 
 scheduler:
   # La hora del escaneo diario ahora es por usuario (panel → Mi cuenta)
   timezone: "America/Monterrey"
 
 ucnl:
-  base_url: "http://licenciatura.ucnl.edu.mx/"
+  base_url: "https://licenciatura.ucnl.edu.mx/"
   headless: false
