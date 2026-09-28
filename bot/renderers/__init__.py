@@ -25,8 +25,9 @@ FORMATS = {
     "pdf": "PDF",
     "triptico": "Tríptico (PDF)",
     "infografia": "Infografía (Word)",
+    "worksheet": "Contestar Word adjunto",
 }
-_EXTENSIONS = {"docx": ".docx", "pptx": ".pptx", "pdf": ".pdf", "triptico": ".pdf", "infografia": ".docx"}
+_EXTENSIONS = {"docx": ".docx", "pptx": ".pptx", "pdf": ".pdf", "triptico": ".pdf", "infografia": ".docx", "worksheet": ".docx"}
 
 _MONTHS = [
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
@@ -51,6 +52,14 @@ def _normalize(text: str) -> str:
 def wants_toc(task_description: str) -> bool:
     """¿Las instrucciones piden índice?"""
     return bool(re.search(r"\b(indice|tabla de contenido)", _normalize(task_description or "")))
+
+
+def wants_worksheet(task_description: str, attachments: list[str] | None) -> bool:
+    """Actividad que se contesta sobre un Word adjunto ("descarga el archivo…", "contesta el documento…")."""
+    if not any(str(a).lower().endswith(".docx") for a in attachments or []):
+        return False
+    text = _normalize(task_description or "")
+    return bool(re.search(r"\b(descarg|adjunt|contest|resuelve|completa|llena|realiza la actividad)", text))
 
 
 def detect_format(task_title: str, task_description: str) -> str:
@@ -103,8 +112,20 @@ async def build_document(
     matricula: str = "",
     place: str = "",
     site_url: str = "",
+    attachment: str | None = None,
 ) -> Path:
     fmt = output_format if output_format in FORMATS else "docx"
+    if fmt == "worksheet":
+        # El Word del profesor con las respuestas escritas en su lugar (sin portada propia)
+        if not attachment or not Path(attachment).exists():
+            raise RuntimeError("Esta tarea no tiene un Word adjunto para contestar")
+        from .worksheet import fill
+        out = Path(output_dir) / f"{safe_filename(task_title)}.docx"
+        _, warnings = fill(Path(attachment), markdown_text, out)
+        for w in warnings:
+            logger.warning(f"Contestar Word: {w}")
+        logger.info(f"Documento generado (Word adjunto contestado): {out.name}")
+        return out
     cover = CoverInfo(
         university="Universidad Ciudadana de Nuevo León",
         career=career,

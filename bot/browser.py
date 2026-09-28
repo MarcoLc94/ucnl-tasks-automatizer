@@ -371,7 +371,39 @@ async def _get_activity_dates(page: Page) -> dict:
     return classify_dates(rows)
 
 
-async def get_assignment_details(page: Page, activity: dict) -> dict | None:
+async def _download_attachments(page: Page, activity: dict, dest_dir: Path | None) -> list[str]:
+    """Descarga los Word (.docx) que el profesor adjuntó a la actividad. Devuelve sus rutas."""
+    import re
+    import urllib.parse
+    if dest_dir is None:
+        return []
+    links = await page.eval_on_selector_all(
+        "#region-main a[href*='pluginfile.php'][href*='introattachment'], #region-main .fileuploadsubmission a[href*='pluginfile.php']",
+        "els => [...new Set(els.map(e => e.href))]",
+    )
+    m = re.search(r"[?&]id=(\d+)", activity["url"])
+    folder = dest_dir / (m.group(1) if m else "otros")
+    saved = []
+    for href in links:
+        name = urllib.parse.unquote(href.split("?")[0].rsplit("/", 1)[-1])
+        if not name.lower().endswith(".docx"):
+            continue
+        target = folder / name
+        try:
+            if not target.exists():
+                resp = await page.context.request.get(href)
+                if not resp.ok:
+                    continue
+                folder.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(await resp.body())
+                logger.info(f"Adjunto descargado: {name}")
+            saved.append(str(target))
+        except Exception as e:
+            logger.warning(f"No se pudo descargar el adjunto {name}: {e}")
+    return saved
+
+
+async def get_assignment_details(page: Page, activity: dict, attachments_dir: Path | None = None) -> dict | None:
     """
     Enter an assignment page and extract description, due date, and submission status.
     Returns: {description, already_submitted, is_past_due, due_date} or None on error.
@@ -420,6 +452,7 @@ async def get_assignment_details(page: Page, activity: dict) -> dict | None:
         description = (await content_el.inner_text()).strip() if content_el else ""
 
     return {
+        "attachments": await _download_attachments(page, activity, attachments_dir),
         "description": description,
         "already_submitted": already_submitted,
         "is_past_due": is_past_due,
@@ -565,6 +598,7 @@ async def submit_assignment(
     course_grade: str = "",
     teacher: str = "",
     include_toc: bool = False,
+    attachment: str | None = None,
 ) -> bool:
     """Generate the document in the chosen format and upload it to the Moodle assignment."""
     from .renderers import build_document
@@ -583,11 +617,12 @@ async def submit_assignment(
         matricula=user.matricula,
         place=user.place,
         site_url=user.base_url,
+        attachment=attachment,
     )
     try:
         doc_path = await build_document(output_format, **doc_args)
     except Exception as e:
-        if output_format == "docx":
+        if output_format in ("docx", "worksheet"):  # el Word adjunto no tiene sustituto
             raise
         logger.exception(f"Error generando {output_format} ({type(e).__name__}: {e}) — se entregará como Word")
         doc_path = await build_document("docx", **doc_args)
@@ -857,7 +892,7 @@ async def run_scan(user: User) -> dict:
                 activities = await get_course_activities(page, course)
                 for activity in activities:
                     if activity["type"] == "assignment":
-                        details = await get_assignment_details(page, activity)
+                        details = await get_assignment_details(page, activity, user.data_dir / "attachments")
                         if details:
                             results.append({
                                 "course": course,

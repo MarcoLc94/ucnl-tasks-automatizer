@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     opens_at          TEXT,
     closes_at         TEXT,
     course_grade      TEXT,
-    teacher           TEXT
+    teacher           TEXT,
+    attachment_path   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 """
@@ -76,7 +77,7 @@ def conn() -> sqlite3.Connection:
 def _migrate(c: sqlite3.Connection) -> None:
     """Agrega columnas nuevas a bases creadas con versiones anteriores."""
     cols = {r["name"] for r in c.execute("PRAGMA table_info(tasks)")}
-    for col in ("opens_at", "closes_at", "course_grade", "teacher"):
+    for col in ("opens_at", "closes_at", "course_grade", "teacher", "attachment_path"):
         if col not in cols:
             c.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
     user_cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}

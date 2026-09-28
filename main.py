@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Response
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.concurrency import run_in_threadpool
+from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -18,9 +19,10 @@ from bot.logger import logger
 from bot import state as st
 from bot import users
 from bot.security import check_secret_key
-from bot.ai import generate_assignment_response
+from bot.ai import generate_assignment_response, generate_worksheet_answers
 from bot.browser import run_scan, submit_assignment, submit_quiz, browser_session, _login
-from bot.renderers import FORMATS, detect_format, build_document, to_pdf_for_preview, wants_toc
+from bot.renderers import FORMATS, detect_format, build_document, to_pdf_for_preview, wants_toc, wants_worksheet
+from bot.renderers.worksheet import outline as worksheet_outline
 from bot.dates import status_from_dates
 
 SESSION_COOKIE = "ucnl_session"
@@ -118,6 +120,10 @@ async def _register_item(user: users.User, item: dict) -> bool:
             st.update_names(existing.id, course_name, task_title)
         st.update_dates(existing.id, opens_at, closes_at)
         st.update_course_info(existing.id, course_grade, teacher)
+        attachments = data.get("attachments") or []
+        if kind == "assignment" and attachments and not existing.attachment_path:
+            st.update_attachment(existing.id, attachments[0])
+            existing = st.get_task(existing.id)
         if existing.status in _REFRESHABLE and existing.status != status:
             st.update_status(existing.id, status)
             if kind == "quiz":
@@ -125,12 +131,13 @@ async def _register_item(user: users.User, item: dict) -> bool:
             logger.info(f"[{user.username}] '{task_title}': {existing.status} → {status}")
         if (kind == "assignment" and status in ("pending_approval", "future")
                 and not (existing.ai_response or "").strip()):
-            await _generate_response(user, existing.id, course_name, task_title, existing.task_description, existing.output_format)
+            await _generate_response(user, existing.id)
         return False
 
     if kind == "assignment":
         description = data["description"]
-        output_format = detect_format(task_title, description)
+        attachments = data.get("attachments") or []
+        output_format = "worksheet" if wants_worksheet(description, attachments) else detect_format(task_title, description)
         task = st.add_task(
             user_id=user.id,
             course_name=course_name,
@@ -146,9 +153,11 @@ async def _register_item(user: users.User, item: dict) -> bool:
             course_grade=course_grade,
             teacher=teacher,
         )
+        if attachments:
+            st.update_attachment(task.id, attachments[0])
         # Se genera también para las que aún no abren, así ya están listas para revisar
         if status in ("pending_approval", "future"):
-            await _generate_response(user, task.id, course_name, task_title, description, output_format)
+            await _generate_response(user, task.id)
         logger.info(f"[{user.username}] Tarea registrada [{status}] ({output_format}): {task_title}")
         return True
 
@@ -169,16 +178,29 @@ async def _register_item(user: users.User, item: dict) -> bool:
     return True
 
 
-async def _generate_response(user, task_id, course_name, task_title, description, output_format):
-    try:
-        response = await run_in_threadpool(
-            generate_assignment_response, course_name, task_title, description, output_format,
-            user.level, user.career,
+async def _compose_response(user: users.User, task: st.PendingTask, output_format: str) -> str:
+    """Genera el contenido con la IA según el formato (Word adjunto contestado o trabajo nuevo)."""
+    if output_format == "worksheet":
+        if not task.attachment_path or not Path(task.attachment_path).exists():
+            raise HTTPException(status_code=400, detail="Esta tarea no tiene un Word adjunto para contestar")
+        doc_outline = await run_in_threadpool(worksheet_outline, Path(task.attachment_path))
+        return await run_in_threadpool(
+            generate_worksheet_answers, task.course_name, task.task_title, task.task_description,
+            doc_outline, user.level, user.display_name, user.place,
         )
-        st.update_response(task_id, response)
+    return await run_in_threadpool(
+        generate_assignment_response, task.course_name, task.task_title, task.task_description,
+        output_format, user.level, user.career,
+    )
+
+
+async def _generate_response(user, task_id):
+    task = st.get_task(task_id)
+    try:
+        st.update_response(task_id, await _compose_response(user, task, task.output_format))
     except Exception as e:
         # Se queda vacía; desde el panel se puede usar "Regenerar"
-        logger.error(f"[{user.username}] No se pudo generar la respuesta de '{task_title}': {e}")
+        logger.error(f"[{user.username}] No se pudo generar la respuesta de '{task.task_title}': {e}")
 
 
 def schedule_user_scan(user: users.User):
@@ -388,7 +410,7 @@ async def approve_task(
     final_text = (body.edited_response or task.ai_response or "").strip()
     if task.task_type == "assignment" and not final_text:
         raise HTTPException(status_code=400, detail="La respuesta está vacía — usa 'Regenerar' o escríbela")
-    placeholder = re.search(r"\[PEGA AQU[IÍ][^\]]*\]", final_text, re.I)
+    placeholder = re.search(r"\[(?:PEGA AQU[IÍ]|COMPLETA)[^\]]*\]", final_text, re.I)
     if task.task_type == "assignment" and placeholder:
         # Guardar lo editado para no perderlo, pero no entregar con el marcador
         if body.edited_response:
@@ -426,6 +448,7 @@ async def preview_document(task_id: str, body: DocumentRequest, user: users.User
             matricula=user.matricula,
             place=user.place,
             site_url=user.base_url,
+            attachment=task.attachment_path,
         )
     except Exception as e:
         logger.exception(f"Error generando vista previa de {task_id} ({body.output_format or task.output_format})")
@@ -449,11 +472,7 @@ async def regenerate_response(task_id: str, body: DocumentRequest, user: users.U
         raise HTTPException(status_code=400, detail=f"La tarea ya está en estado: {task.status}")
     _validate_format(body.output_format)
     output_format = body.output_format or task.output_format
-    response = await run_in_threadpool(
-        generate_assignment_response,
-        task.course_name, task.task_title, task.task_description, output_format,
-        user.level, user.career,
-    )
+    response = await _compose_response(user, task, output_format)
     st.update_response(task_id, response)
     st.update_format(task_id, output_format)
     return {"ai_response": response, "output_format": output_format}
@@ -557,6 +576,7 @@ async def _submit_task(task_id: str):
                 course_grade=task.course_grade or "",
                 teacher=task.teacher or "",
                 include_toc=wants_toc(task.task_description),
+                attachment=task.attachment_path,
             )
         else:
             ok = await submit_quiz(user, task.task_url, course_name=task.course_name)
@@ -592,6 +612,7 @@ def _task_to_dict(task: st.PendingTask) -> dict:
         "ai_response": task.ai_response,
         "output_format": task.output_format,
         "course_grade": task.course_grade,
+        "has_attachment": bool(task.attachment_path),
         "teacher": task.teacher,
         "opens_at": task.opens_at,
         "closes_at": task.closes_at,
@@ -922,7 +943,10 @@ function renderTask(t) {
       </div>
       <div class="mt-3">
         <p class="text-xs font-semibold text-gray-500 mb-1">RESPUESTA GENERADA POR IA
-          <span class="font-normal normal-case text-gray-400">— Markdown: ## secciones, - viñetas, | tablas |, bloques de gráfica</span></p>
+          <span class="font-normal normal-case text-gray-400">${t.output_format === 'worksheet'
+            ? '— Respuestas por ubicación: [P7] texto · [T0 R1 C2] celda · [P43] SUBRAYAR: opción. Reemplaza cada [COMPLETA: …]'
+            : '— Markdown: ## secciones, - viñetas, | tablas |, bloques de gráfica'}</span></p>
+          ${t.has_attachment ? '<p class="text-xs text-indigo-700 mb-1">📎 Esta actividad trae un Word del profesor — usa el formato "Contestar Word adjunto" para contestarlo en su lugar.</p>' : ''}
         <textarea id="resp-${t.id}" rows="12"
           class="w-full text-sm border rounded p-2 text-gray-800 ${!isEditable(t) ? 'bg-gray-100' : ''}"
           ${!isEditable(t) ? 'disabled' : ''}>${t.ai_response || ''}</textarea>

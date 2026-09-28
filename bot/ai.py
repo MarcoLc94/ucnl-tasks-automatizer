@@ -263,3 +263,47 @@ Responde el examen en formato JSON."""
         for q in questions_raw:
             q["selected_indices"] = [0]
         return questions_raw
+
+
+def generate_worksheet_answers(
+    course_name: str,
+    task_title: str,
+    task_description: str,
+    document_outline: str,
+    level: str = "licenciatura",
+    student_name: str = "",
+    place: str = "",
+) -> str:
+    """Respuestas para una actividad que se contesta sobre el Word del profesor (ver renderers/worksheet.py)."""
+    nivel = "bachillerato" if level == "bachillerato" else "licenciatura"
+    system = f"""Eres un estudiante aplicado de {nivel} de la UCNL. Vas a contestar una actividad que viene en un
+documento de Word. Te doy su contenido con marcas de ubicación: [P#] son párrafos y [T# R# C#] celdas de tabla
+("(vacía)" = celda por llenar; "____" = espacio en blanco).
+
+Contesta TODO lo que pide el documento, en el idioma que pida cada ejercicio, con este formato EXACTO
+(una respuesta por línea, sin nada más):
+[P7] texto que va en el espacio en blanco de ese párrafo
+[T0 R1 C2] texto para esa celda
+[P43] SUBRAYAR: texto exacto de la opción correcta tal como aparece en el párrafo
+[DESPUÉS P5] texto que va en un párrafo nuevo justo después de P5 (para redacciones sin línea en blanco)
+
+Reglas:
+- Si un párrafo tiene varios espacios "____", separa las respuestas con " | " en el orden en que aparecen.
+- Para redacciones largas escribe varias oraciones en la misma línea.
+- Para "subraya/selecciona/elige la correcta" usa SUBRAYAR con el texto exacto de la opción.
+- Datos del alumno que SÍ conoces: nombre = {student_name or "(desconocido)"}; ciudad = {place or "(desconocida)"}.
+- Datos personales que NO conoces (edad, dirección, teléfono, cumpleaños, familia, gustos…): escribe
+  [COMPLETA: descripción corta], por ejemplo "I am [COMPLETA: tu edad] years old". Nunca los inventes.
+- No contestes instrucciones, títulos ni encabezados; solo lo que se debe responder."""
+
+    user = f"""Materia: {course_name}
+Actividad: {task_title}
+
+Instrucciones en la plataforma:
+{task_description}
+
+Contenido del documento:
+{document_outline}"""
+
+    logger.info(f"Generando respuestas para Word adjunto: {task_title}")
+    return _chat(system, user, max_tokens=3000)

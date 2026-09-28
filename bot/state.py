@@ -51,6 +51,7 @@ class PendingTask:
     closes_at: str | None = None  # ISO, hora de la UCNL
     course_grade: str | None = None  # ej. "5to Tetramestre"
     teacher: str | None = None
+    attachment_path: str | None = None  # Word adjunto por el profesor (actividades para contestar)
 
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
@@ -77,6 +78,7 @@ def _from_row(row) -> PendingTask | None:
         closes_at=row["closes_at"],
         course_grade=row["course_grade"],
         teacher=row["teacher"],
+        attachment_path=row["attachment_path"],
     )
 
 
@@ -228,6 +230,10 @@ def find_existing_by_url(user_id: int, task_url: str) -> PendingTask | None:
 
 def update_names(task_id: str, course_name: str, task_title: str) -> bool:
     return _update(task_id, course_name=course_name, task_title=task_title)
+
+
+def update_attachment(task_id: str, attachment_path: str | None) -> bool:
+    return _update(task_id, attachment_path=attachment_path)
 
 
 def update_dates(task_id: str, opens_at: str | None, closes_at: str | None) -> bool:
