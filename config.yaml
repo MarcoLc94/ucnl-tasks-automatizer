@@ -12,5 +12,9 @@ scheduler:
   timezone: "America/Monterrey"
 
 ucnl:
-  base_url: "https://licenciatura.ucnl.edu.mx/"
+  # Plataforma por usuario (se elige en "Mi cuenta")
+  platforms:
+    licenciatura: "https://licenciatura.ucnl.edu.mx/"
+    bachillerato: "https://bachillerato.ucnl.edu.mx/"
+  base_url: "https://licenciatura.ucnl.edu.mx/"  # por defecto y para scan_debug
   headless: false

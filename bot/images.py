@@ -56,3 +56,30 @@ def fetch_photo(query: str, work_dir: Path, orientation: str = "landscape") -> d
     except Exception as e:
         logger.warning(f"Pexels: no se pudo obtener imagen para '{query}': {e}")
         return None
+
+
+def get_site_logo(base_url: str) -> Path | None:
+    """Escudo/logo oficial de la plataforma (licenciatura o bachillerato), tomado de su página de login."""
+    import re
+    from .db import DATA_DIR
+
+    host = urllib.parse.urlsplit(base_url).netloc or "ucnl"
+    target = DATA_DIR / "cache" / f"logo_{host}.jpg"
+    if target.exists():
+        return target
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/login/index.php", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+            html = r.read().decode("utf-8", "replace")
+        m = re.search(r'<img[^>]+id="logoimage"[^>]+src="([^"]+)"', html) or re.search(r'<img[^>]+src="([^"]+logo[^"]+)"', html)
+        if not m:
+            return None
+        src = m.group(1)
+        src = "https:" + src if src.startswith("//") else urllib.parse.urljoin(base_url, src)
+        with urllib.request.urlopen(urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"}), timeout=_TIMEOUT) as r:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(r.read())
+        return target
+    except Exception as e:
+        logger.warning(f"No se pudo obtener el logo de {base_url}: {e}")
+        return None

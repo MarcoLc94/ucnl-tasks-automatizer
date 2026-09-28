@@ -1,3 +1,4 @@
+import re
 import json
 import time
 from datetime import datetime
@@ -5,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Response
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.concurrency import run_in_threadpool
+from typing import Literal
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -18,7 +20,7 @@ from bot import users
 from bot.security import check_secret_key
 from bot.ai import generate_assignment_response
 from bot.browser import run_scan, submit_assignment, submit_quiz, browser_session, _login
-from bot.renderers import FORMATS, detect_format, build_document, to_pdf_for_preview
+from bot.renderers import FORMATS, detect_format, build_document, to_pdf_for_preview, wants_toc
 from bot.dates import status_from_dates
 
 SESSION_COOKIE = "ucnl_session"
@@ -110,8 +112,10 @@ async def _register_item(user: users.User, item: dict) -> bool:
 
     course_grade, teacher = activity.get("course_grade", ""), activity.get("teacher", "")
 
-    existing = st.find_existing(user.id, course_name, task_title, task_url)
+    existing = st.find_existing_by_url(user.id, task_url) or st.find_existing(user.id, course_name, task_title, task_url)
     if existing:
+        if existing.course_name != course_name or existing.task_title != task_title:
+            st.update_names(existing.id, course_name, task_title)
         st.update_dates(existing.id, opens_at, closes_at)
         st.update_course_info(existing.id, course_grade, teacher)
         if existing.status in _REFRESHABLE and existing.status != status:
@@ -168,7 +172,8 @@ async def _register_item(user: users.User, item: dict) -> bool:
 async def _generate_response(user, task_id, course_name, task_title, description, output_format):
     try:
         response = await run_in_threadpool(
-            generate_assignment_response, course_name, task_title, description, output_format
+            generate_assignment_response, course_name, task_title, description, output_format,
+            user.level, user.career,
         )
         st.update_response(task_id, response)
     except Exception as e:
@@ -267,6 +272,9 @@ def _user_to_dict(user: users.User) -> dict:
         "username": user.username,
         "display_name": user.display_name,
         "career": user.career,
+        "platform": user.platform,
+        "matricula": user.matricula,
+        "place": user.place,
         "ucnl_username": user.ucnl_username,
         "has_ucnl_password": bool(user.ucnl_password_enc),
         "scan_hour": user.scan_hour,
@@ -277,6 +285,9 @@ def _user_to_dict(user: users.User) -> dict:
 class ProfileRequest(BaseModel):
     display_name: str | None = Field(None, min_length=1, max_length=120)
     career: str | None = Field(None, min_length=1, max_length=160)
+    platform: Literal["licenciatura", "bachillerato"] | None = None
+    matricula: str | None = Field(None, max_length=40)
+    place: str | None = Field(None, max_length=120)
     ucnl_username: str | None = Field(None, max_length=120)
     ucnl_password: str | None = Field(None, max_length=200)
     scan_hour: int | None = Field(None, ge=0, le=23)
@@ -300,6 +311,9 @@ def update_me(body: ProfileRequest, user: users.User = Depends(current_user)):
         user.id,
         display_name=body.display_name,
         career=body.career,
+        platform=body.platform if body.platform != user.platform else None,
+        matricula=body.matricula,
+        place=body.place,
         ucnl_username=body.ucnl_username,
         ucnl_password=body.ucnl_password or None,
         scan_hour=body.scan_hour,
@@ -353,7 +367,9 @@ async def approve_task(
     user: users.User = Depends(current_user),
 ):
     task = _own_task(task_id, user)
-    if task.status != "pending_approval":
+    # Las tareas (no exámenes) que fallaron al entregarse se pueden reintentar
+    retryable = task.task_type == "assignment" and task.status == "failed"
+    if task.status != "pending_approval" and not retryable:
         raise HTTPException(status_code=400, detail=f"La tarea ya está en estado: {task.status}")
     window = status_from_dates(task.opens_at, task.closes_at)
     if window != "pending_approval":
@@ -369,8 +385,18 @@ async def approve_task(
     if body.output_format and task.task_type == "assignment":
         st.update_format(task_id, body.output_format)
 
-    if task.task_type == "assignment" and not (body.edited_response or task.ai_response or "").strip():
+    final_text = (body.edited_response or task.ai_response or "").strip()
+    if task.task_type == "assignment" and not final_text:
         raise HTTPException(status_code=400, detail="La respuesta está vacía — usa 'Regenerar' o escríbela")
+    placeholder = re.search(r"\[PEGA AQU[IÍ][^\]]*\]", final_text, re.I)
+    if task.task_type == "assignment" and placeholder:
+        # Guardar lo editado para no perderlo, pero no entregar con el marcador
+        if body.edited_response:
+            st.update_response(task_id, body.edited_response)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Falta completar: {placeholder.group(0)} — reemplázalo en el texto antes de entregar",
+        )
 
     st.update_status(task_id, "approved")
     background_tasks.add_task(_submit_task, task_id)
@@ -395,10 +421,15 @@ async def preview_document(task_id: str, body: DocumentRequest, user: users.User
             career=user.career,
             grade=task.course_grade or "",
             teacher=task.teacher or "",
+            include_toc=wants_toc(task.task_description),
+            level=user.level,
+            matricula=user.matricula,
+            place=user.place,
+            site_url=user.base_url,
         )
     except Exception as e:
-        logger.error(f"Error generando vista previa de {task_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generando documento: {e}")
+        logger.exception(f"Error generando vista previa de {task_id} ({body.output_format or task.output_format})")
+        raise HTTPException(status_code=500, detail=f"Error generando documento: {type(e).__name__}: {e}")
     if body.view and path.suffix != ".pdf":
         pdf = await to_pdf_for_preview(path)
         if pdf:
@@ -414,13 +445,14 @@ async def regenerate_response(task_id: str, body: DocumentRequest, user: users.U
     task = _own_task(task_id, user)
     if task.task_type != "assignment":
         raise HTTPException(status_code=400, detail="Solo aplica para tareas")
-    if task.status != "pending_approval":
+    if task.status not in ("pending_approval", "failed"):
         raise HTTPException(status_code=400, detail=f"La tarea ya está en estado: {task.status}")
     _validate_format(body.output_format)
     output_format = body.output_format or task.output_format
     response = await run_in_threadpool(
         generate_assignment_response,
         task.course_name, task.task_title, task.task_description, output_format,
+        user.level, user.career,
     )
     st.update_response(task_id, response)
     st.update_format(task_id, output_format)
@@ -524,6 +556,7 @@ async def _submit_task(task_id: str):
                 output_format=task.output_format,
                 course_grade=task.course_grade or "",
                 teacher=task.teacher or "",
+                include_toc=wants_toc(task.task_description),
             )
         else:
             ok = await submit_quiz(user, task.task_url, course_name=task.course_name)
@@ -668,12 +701,27 @@ def _render_ui() -> str:
         <input id="s-display" required class="w-full border rounded px-3 py-2 text-sm mt-1">
       </label>
       <label class="block">
-        <span class="text-xs font-semibold text-gray-500">LICENCIATURA (aparece en las portadas)</span>
+        <span id="s-career-label" class="text-xs font-semibold text-gray-500">LICENCIATURA (aparece en las portadas)</span>
         <input id="s-career" required class="w-full border rounded px-3 py-2 text-sm mt-1">
+      </label>
+      <label class="block">
+        <span class="text-xs font-semibold text-gray-500">MATRÍCULA (aparece en las portadas)</span>
+        <input id="s-matricula" class="w-full border rounded px-3 py-2 text-sm mt-1">
+      </label>
+      <label class="block">
+        <span class="text-xs font-semibold text-gray-500">LUGAR (portada: "Lugar y fecha")</span>
+        <input id="s-place" class="w-full border rounded px-3 py-2 text-sm mt-1" placeholder="Monterrey, Nuevo León">
       </label>
       <label class="block">
         <span class="text-xs font-semibold text-gray-500">HORA DEL ESCANEO DIARIO</span>
         <input id="s-time" type="time" required class="w-full border rounded px-3 py-2 text-sm mt-1">
+      </label>
+      <label class="block">
+        <span class="text-xs font-semibold text-gray-500">PLATAFORMA UCNL</span>
+        <select id="s-platform" class="w-full border rounded px-3 py-2 text-sm mt-1">
+          <option value="licenciatura">Licenciatura (licenciatura.ucnl.edu.mx)</option>
+          <option value="bachillerato">Bachillerato (bachillerato.ucnl.edu.mx)</option>
+        </select>
       </label>
       <label class="block">
         <span class="text-xs font-semibold text-gray-500">USUARIO UCNL</span>
@@ -821,6 +869,11 @@ function toggleCourse(btn) {
   chevron.style.transform = hidden ? 'rotate(0deg)' : 'rotate(-90deg)';
 }
 
+function isEditable(t) {
+  // Pendientes, y tareas que fallaron al entregarse (se pueden corregir y reintentar)
+  return t.status === 'pending_approval' || (t.task_type === 'assignment' && t.status === 'failed');
+}
+
 function renderTask(t) {
   const statusColors = {
     pending_approval: 'bg-yellow-100 border-yellow-300 text-yellow-800',
@@ -857,13 +910,13 @@ function renderTask(t) {
       <div class="mt-3 flex flex-wrap items-center gap-2">
         <p class="text-xs font-semibold text-gray-500">FORMATO DE ENTREGA</p>
         <select id="fmt-${t.id}" class="text-sm border rounded px-2 py-1"
-          ${t.status !== 'pending_approval' ? 'disabled' : ''}>
+          ${!isEditable(t) ? 'disabled' : ''}>
           ${Object.entries(FORMATS).map(([k, v]) =>
             `<option value="${k}" ${k === (t.output_format || 'docx') ? 'selected' : ''}>${v}</option>`).join('')}
         </select>
         <button onclick="previewDoc('${t.id}')" id="prev-${t.id}"
           class="text-sm bg-gray-100 text-gray-700 px-3 py-1 rounded hover:bg-gray-200">Vista previa</button>
-        ${t.status === 'pending_approval' ? `
+        ${isEditable(t) ? `
         <button onclick="regenerate('${t.id}')" id="regen-${t.id}"
           class="text-sm bg-indigo-50 text-indigo-700 px-3 py-1 rounded hover:bg-indigo-100">Regenerar para este formato</button>` : ''}
       </div>
@@ -871,8 +924,8 @@ function renderTask(t) {
         <p class="text-xs font-semibold text-gray-500 mb-1">RESPUESTA GENERADA POR IA
           <span class="font-normal normal-case text-gray-400">— Markdown: ## secciones, - viñetas, | tablas |, bloques de gráfica</span></p>
         <textarea id="resp-${t.id}" rows="12"
-          class="w-full text-sm border rounded p-2 text-gray-800 ${t.status !== 'pending_approval' ? 'bg-gray-100' : ''}"
-          ${t.status !== 'pending_approval' ? 'disabled' : ''}>${t.ai_response || ''}</textarea>
+          class="w-full text-sm border rounded p-2 text-gray-800 ${!isEditable(t) ? 'bg-gray-100' : ''}"
+          ${!isEditable(t) ? 'disabled' : ''}>${t.ai_response || ''}</textarea>
       </div>
     `;
   } else {
@@ -904,7 +957,7 @@ function renderTask(t) {
     `;
   }
 
-  const canAct = t.status === 'pending_approval';
+  const canAct = isEditable(t);
   const notOpenYet = t.opens_at && new Date(t.opens_at) > new Date();
   const canAttempt = t.task_type === 'exam' && !notOpenYet && ['future', 'failed', 'rejected', 'expired'].includes(t.status);
   const actions = canAct ? `
@@ -960,11 +1013,17 @@ async function approve(taskId, type) {
     const fmt = document.getElementById(`fmt-${taskId}`);
     body.output_format = fmt ? fmt.value : null;
   }
-  await fetch(`/api/approve/${taskId}`, {
+  const r = await fetch(`/api/approve/${taskId}`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body),
   });
+  if (!r.ok) {
+    // No recargar la lista: se perderían los cambios del texto
+    const d = await r.json().catch(() => ({}));
+    alert(d.detail || 'No se pudo aprobar');
+    return;
+  }
   loadTasks();
   loadStatus();
 }
@@ -1089,6 +1148,10 @@ async function toggleSettings(show) {
   const me = await (await fetch('/api/me')).json();
   document.getElementById('s-display').value = me.display_name;
   document.getElementById('s-career').value = me.career;
+  document.getElementById('s-platform').value = me.platform;
+  document.getElementById('s-matricula').value = me.matricula;
+  document.getElementById('s-place').value = me.place;
+  updateCareerLabel();
   document.getElementById('s-time').value =
     `${String(me.scan_hour).padStart(2, '0')}:${String(me.scan_minute).padStart(2, '0')}`;
   document.getElementById('s-ucnl-user').value = me.ucnl_username;
@@ -1098,12 +1161,29 @@ async function toggleSettings(show) {
   document.getElementById('s-msg').classList.add('hidden');
 }
 
+function updateCareerLabel() {
+  const bach = document.getElementById('s-platform').value === 'bachillerato';
+  document.getElementById('s-career-label').textContent = bach
+    ? 'BACHILLERATO / ÁREA (aparece en las portadas)'
+    : 'LICENCIATURA (aparece en las portadas)';
+}
+document.addEventListener('change', (e) => {
+  if (e.target && e.target.id === 's-platform') {
+    updateCareerLabel();
+    const career = document.getElementById('s-career');
+    if (e.target.value === 'bachillerato' && /ingenier|licenciatura/i.test(career.value)) career.value = 'Bachillerato General';
+  }
+});
+
 async function saveSettings(e) {
   e.preventDefault();
   const [h, m] = document.getElementById('s-time').value.split(':').map(Number);
   const body = {
     display_name: document.getElementById('s-display').value,
     career: document.getElementById('s-career').value,
+    platform: document.getElementById('s-platform').value,
+    matricula: document.getElementById('s-matricula').value,
+    place: document.getElementById('s-place').value,
     ucnl_username: document.getElementById('s-ucnl-user').value,
     ucnl_password: document.getElementById('s-ucnl-pass').value || null,
     scan_hour: h,

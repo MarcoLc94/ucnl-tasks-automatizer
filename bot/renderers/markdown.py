@@ -23,6 +23,8 @@ _FENCE = re.compile(r"^\s*```\s*(\w*)\s*$")
 _IMAGE = re.compile(r"^!\[([^\]]+)\]\(([^)]*)\)$")
 _INLINE = re.compile(r"(\*\*[^*]+\*\*|\*[^*]+\*)")
 
+DIAGRAM_FENCES = {"diagrama", "diagram", "mermaid"}
+_MERMAID_STARTS = ("flowchart", "graph ", "graph\t", "mindmap", "sequencediagram", "timeline", "classdiagram")
 CHART_FENCES = {"grafica", "gráfica", "chart", "grafico", "gráfico", "json"}
 
 
@@ -57,6 +59,10 @@ def parse(text: str) -> list[dict]:
                 i += 1
             i += 1  # cerrar fence
             raw = "\n".join(body)
+            first = raw.strip().split("\n", 1)[0].strip().lower()
+            if lang in DIAGRAM_FENCES or (lang == "" and first.startswith(_MERMAID_STARTS)):
+                blocks.append({"type": "diagram", "code": raw.strip()})
+                continue
             if lang in CHART_FENCES or lang == "":
                 try:
                     blocks.append({"type": "chart", "spec": json.loads(raw)})

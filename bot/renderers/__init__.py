@@ -10,8 +10,11 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 
+from ..images import get_site_logo
 from ..logger import logger
 from .common import CoverInfo
+from .diagrams import DiagramError, render_diagrams  # noqa: F401 (DiagramError se re-exporta)
+from .markdown import parse
 from .docx_renderer import render_docx
 from .pdf_renderer import render_infografia_png, render_pdf, render_triptico
 from .pptx_renderer import render_pptx
@@ -45,6 +48,11 @@ def _normalize(text: str) -> str:
     return "".join(c for c in text if not unicodedata.combining(c))
 
 
+def wants_toc(task_description: str) -> bool:
+    """¿Las instrucciones piden índice?"""
+    return bool(re.search(r"\b(indice|tabla de contenido)", _normalize(task_description or "")))
+
+
 def detect_format(task_title: str, task_description: str) -> str:
     """Deduce el formato de entrega a partir del título y las instrucciones."""
     text = _normalize(f"{task_title}\n{task_description}")
@@ -60,12 +68,19 @@ def spanish_date(dt: datetime | None = None) -> str:
 
 
 def clean_course_name(name: str) -> str:
-    """'Desarrollo Sustentable (A) (2026-3)' → 'Desarrollo Sustentable'."""
+    """'Desarrollo Sustentable (A) (2026-3)' → 'Desarrollo Sustentable'. Solo quita grupo y periodo."""
+    pattern = r"\s*\((?:[A-Z]{1,2}\d?|\d{4}-\d{1,2})\)\s*$"
     while True:
-        cleaned = re.sub(r"\s*\([^()]*\)\s*$", "", name).strip()
+        cleaned = re.sub(pattern, "", name).strip()
         if cleaned == name or not cleaned:
             return name
         name = cleaned
+
+
+def course_group(name: str) -> str:
+    """'Química I (F) (2026-3)' → 'F'."""
+    m = re.search(r"\(([A-Z]{1,2}\d?)\)", name or "")
+    return m.group(1) if m else ""
 
 
 def safe_filename(title: str) -> str:
@@ -83,6 +98,11 @@ async def build_document(
     career: str = "",
     grade: str = "",
     teacher: str = "",
+    include_toc: bool = False,
+    level: str = "licenciatura",
+    matricula: str = "",
+    place: str = "",
+    site_url: str = "",
 ) -> Path:
     fmt = output_format if output_format in FORMATS else "docx"
     cover = CoverInfo(
@@ -94,12 +114,19 @@ async def build_document(
         date=spanish_date(),
         grade=grade,
         teacher=teacher,
+        career_label="Bachillerato" if level == "bachillerato" else "Licenciatura",
+        group=course_group(course_name),
+        matricula=matricula,
+        place=place,
+        logo=get_site_logo(site_url) if site_url else None,
     )
     path = Path(output_dir) / f"{safe_filename(task_title)}{_EXTENSIONS[fmt]}"
     work_dir = Path(tempfile.mkdtemp(prefix="ucnl_render_"))
     try:
+        # Los diagramas se dibujan antes (es asíncrono); los renderizadores solo insertan el PNG
+        await render_diagrams(parse(markdown_text), work_dir)
         if fmt == "docx":
-            render_docx(markdown_text, cover, path, work_dir)
+            render_docx(markdown_text, cover, path, work_dir, include_toc=include_toc)
         elif fmt == "pptx":
             render_pptx(markdown_text, cover, path, work_dir)
         elif fmt == "pdf":
@@ -107,7 +134,7 @@ async def build_document(
         elif fmt == "infografia":
             # Word con portada/intro/conclusiones/referencias; el contenido es la infografía como imagen
             poster = await render_infografia_png(markdown_text, cover, work_dir / "infografia.png", work_dir)
-            render_docx(markdown_text, cover, path, work_dir, body_image=poster)
+            render_docx(markdown_text, cover, path, work_dir, body_image=poster, include_toc=include_toc)
         else:
             await render_triptico(markdown_text, cover, path, work_dir)
     finally:

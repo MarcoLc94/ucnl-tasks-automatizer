@@ -12,6 +12,7 @@ from PIL import Image
 
 from ..images import fetch_photo
 from .charts import PALETTE, normalize_chart
+from .diagrams import diagram_path
 from .common import CoverInfo, reference_entries, split_document
 from .markdown import inline_runs, parse, plain, split_sections
 
@@ -66,6 +67,11 @@ def render_pptx(markdown_text: str, cover: CoverInfo, path: Path, work_dir: Path
             elif kind == "table":
                 flush()
                 _table_slide(prs.slides.add_slide(blank), title, block["header"], block["rows"])
+            elif kind == "diagram":
+                flush()
+                png = diagram_path(block["code"], work_dir)
+                if png.exists():
+                    _diagram_slide(prs.slides.add_slide(blank), title, png)
             elif kind == "chart":
                 flush()
                 chart = normalize_chart(block["spec"])
@@ -133,6 +139,16 @@ def _title_slide(slide, cover: CoverInfo):
     _rect(slide, 0, 0, SLIDE_W, SLIDE_H, PRIMARY)
     _rect(slide, Inches(0.8), Inches(3.55), Inches(1.5), Inches(0.08), ACCENT)
     _text(slide, Inches(0.8), Inches(0.6), Inches(11.5), Inches(0.5), cover.university.upper(), 14, True, WHITE)
+    if cover.logo:
+        # Escudo en un recuadro blanco arriba a la derecha
+        with Image.open(cover.logo) as im:
+            ratio = im.width / im.height
+        h = Inches(1.1)
+        w = min(int(h * ratio), Inches(4.2))
+        h = int(w / ratio)
+        left = SLIDE_W - w - Inches(0.9)
+        _rect(slide, left - Inches(0.15), Inches(0.45), w + Inches(0.3), h + Inches(0.3), WHITE)
+        slide.shapes.add_picture(str(cover.logo), left, Inches(0.6), w, h)
     _text(slide, Inches(0.8), Inches(1.0), Inches(11.5), Inches(0.4), cover.career, 12, color=RGBColor(0xC8, 0xD6, 0xE5))
     tb = _text(slide, Inches(0.8), Inches(1.9), Inches(11.5), Inches(1.6), cover.title, 40, True, WHITE)
     tb.text_frame.vertical_anchor = MSO_ANCHOR.BOTTOM
@@ -141,7 +157,7 @@ def _title_slide(slide, cover: CoverInfo):
     box = slide.shapes.add_textbox(Inches(0.8), Inches(3.9), Inches(11.5), Inches(3.2))
     tf = box.text_frame
     tf.word_wrap = True
-    for i, (label, value) in enumerate(f for f in cover.fields() if f[0] != "Licenciatura"):
+    for i, (label, value) in enumerate(f for f in cover.fields() if f[0] != cover.career_label):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.space_after = Pt(6)
         r1 = p.add_run()
@@ -232,6 +248,15 @@ def _table_slide(slide, title: str, header: list[str], rows: list[list[str]]):
             cell.fill.fore_color.rgb = PRIMARY if r_idx == 0 else (
                 RGBColor(0xEE, 0xF3, 0xF8) if r_idx % 2 else WHITE
             )
+
+
+def _diagram_slide(slide, title: str, png):
+    _header(slide, title)
+    with Image.open(png) as im:
+        ratio = im.width / im.height
+    max_w, max_h = Inches(12.1), Inches(5.8)
+    w, h = (max_w, int(max_w / ratio)) if max_w / ratio <= max_h else (int(max_h * ratio), max_h)
+    slide.shapes.add_picture(str(png), int((SLIDE_W - w) / 2), Inches(1.5), w, h)
 
 
 def _chart_slide(slide, title: str, chart: dict):

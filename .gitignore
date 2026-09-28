@@ -9,3 +9,4 @@ data/docs/
 data/app.db*
 data/users/
 data/tasks.json.migrated
+data/cache/

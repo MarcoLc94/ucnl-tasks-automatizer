@@ -9,6 +9,7 @@ from playwright.async_api import async_playwright
 
 from ..images import fetch_photo
 from .charts import render_chart_png
+from .diagrams import diagram_path
 from .common import CoverInfo, reference_entries, split_document
 from .markdown import inline_runs, parse, plain, split_sections
 
@@ -29,6 +30,7 @@ figure { margin: 0.6em 0 1em; text-align: center; }
 figure img { max-width: 100%; }
 figcaption { font-size: 0.85em; color: #666; margin-top: 0.3em; }
 figure.photo img { width: 100%; max-height: 3.2in; object-fit: cover; border-radius: 6px; }
+figure.diagram img { max-width: 100%; max-height: 8in; }
 blockquote.callout { margin: 0.6em 0; padding: 0.5em 0.8em; border-left: 4px solid var(--accent);
   background: var(--soft); font-size: 1.05em; }
 blockquote.callout strong { color: var(--accent); font-size: 1.4em; }
@@ -71,6 +73,12 @@ def _block_html(block: dict, work_dir: Path, counter: list[int]) -> str:
         b64 = base64.b64encode(photo["path"].read_bytes()).decode()
         return (f'<figure class="photo"><img src="data:image/jpeg;base64,{b64}">'
                 f'<figcaption>{html.escape(photo["credit"])}</figcaption></figure>')
+    if kind == "diagram":
+        png = diagram_path(block["code"], work_dir)
+        if not png.exists():
+            return ""
+        b64 = base64.b64encode(png.read_bytes()).decode()
+        return f'<figure class="diagram"><img src="data:image/png;base64,{b64}"></figure>'
     if kind == "chart":
         counter[0] += 1
         png = render_chart_png(block["spec"], work_dir / f"chart_{counter[0]}.png")
@@ -154,6 +162,10 @@ async def render_pdf(markdown_text: str, cover: CoverInfo, path: Path, work_dir:
         sections.append(f'<section class="part refs"><h2>Referencias</h2>{refs}</section>')
 
     cover_rows = "".join(f"<div><strong>{e(k)}:</strong> {e(v)}</div>" for k, v in cover.fields())
+    logo_html = ""
+    if cover.logo:
+        logo_b64 = base64.b64encode(cover.logo.read_bytes()).decode()
+        logo_html = f'<img class="logo" src="data:image/jpeg;base64,{logo_b64}">'
     doc = f"""<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><style>
 {_BASE_CSS}
 @page {{ size: Letter; margin: 2.2cm 2.4cm; }}
@@ -169,12 +181,13 @@ figure, table {{ break-inside: avoid; }}
 .cover {{ height: 23cm; display: flex; flex-direction: column; justify-content: space-between;
           text-align: center; }}
 .cover .uni {{ font-size: 18pt; font-weight: 700; color: var(--primary); }}
+.cover .logo {{ max-width: 11cm; max-height: 4.2cm; display: block; margin: 0 auto 0.4cm; }}
 .cover .title {{ font-size: 26pt; font-weight: 800; color: var(--primary); }}
 .cover .bar {{ width: 3cm; height: 5px; background: var(--accent); margin: 0.6em auto 0; }}
 .cover .meta {{ font-size: 12pt; line-height: 2; }}
 </style></head><body>
 <section class="cover">
-  <div class="uni">{e(cover.university)}</div>
+  <div>{logo_html}<div class="uni">{e(cover.university)}</div></div>
   <div><div class="title">{e(cover.title)}</div><div class="bar"></div></div>
   <div class="meta">{cover_rows}</div>
 </section>
@@ -197,7 +210,7 @@ _PANEL_COUNT = 5  # paneles de contenido: 3 interiores + solapa + contraportada
 
 def _block_weight(block: dict) -> int:
     kind = block["type"]
-    if kind in ("chart", "image"):
+    if kind in ("chart", "image", "diagram"):
         return 500
     if kind == "table":
         return 90 * (len(block["rows"]) + 1)
@@ -352,8 +365,8 @@ async def render_infografia_png(markdown_text: str, cover: CoverInfo, path: Path
     stats, charts, images = [], [], [b for b in blocks if b["type"] == "image"]
     for sec in body_sections:
         stats += [b for b in sec["blocks"] if b["type"] == "callout"]
-        charts += [b for b in sec["blocks"] if b["type"] == "chart"]
-        sec["blocks"] = [b for b in sec["blocks"] if b["type"] not in ("callout", "chart", "image")]
+        charts += [b for b in sec["blocks"] if b["type"] in ("chart", "diagram")]
+        sec["blocks"] = [b for b in sec["blocks"] if b["type"] not in ("callout", "chart", "diagram", "image")]
 
     hero_style, hero_credit = "", ""
     for img in images:

@@ -14,6 +14,9 @@ class User:
     username: str
     display_name: str
     career: str
+    platform: str
+    matricula: str
+    place: str
     ucnl_username: str
     ucnl_password_enc: str
     scan_hour: int
@@ -22,6 +25,17 @@ class User:
     @property
     def ucnl_password(self) -> str:
         return decrypt(self.ucnl_password_enc)
+
+    @property
+    def base_url(self) -> str:
+        from .config import get
+        ucnl = get()["ucnl"]
+        return ucnl.get("platforms", {}).get(self.platform, ucnl["base_url"]).rstrip("/")
+
+    @property
+    def level(self) -> str:
+        """'licenciatura' o 'bachillerato' — para la IA y la portada."""
+        return self.platform
 
     @property
     def has_ucnl_credentials(self) -> bool:
@@ -50,6 +64,9 @@ def _from_row(row) -> User | None:
         username=row["username"],
         display_name=row["display_name"],
         career=row["career"],
+        platform=row["platform"],
+        matricula=row["matricula"],
+        place=row["place"],
         ucnl_username=row["ucnl_username"],
         ucnl_password_enc=row["ucnl_password_enc"],
         scan_hour=row["scan_hour"],
@@ -99,6 +116,9 @@ def update_profile(
     user_id: int,
     display_name: str | None = None,
     career: str | None = None,
+    platform: str | None = None,
+    matricula: str | None = None,
+    place: str | None = None,
     ucnl_username: str | None = None,
     ucnl_password: str | None = None,
     scan_hour: int | None = None,
@@ -107,6 +127,9 @@ def update_profile(
     fields = {
         "display_name": display_name,
         "career": career,
+        "platform": platform,
+        "matricula": matricula,
+        "place": place,
         "ucnl_username": ucnl_username,
         "ucnl_password_enc": encrypt(ucnl_password) if ucnl_password else None,
         "scan_hour": scan_hour,
@@ -116,7 +139,7 @@ def update_profile(
     if updates:
         sets = ", ".join(f"{k} = :{k}" for k in updates)
         db.execute(f"UPDATE users SET {sets} WHERE id = :id", {**updates, "id": user_id})
-    if ucnl_username is not None or ucnl_password:
+    if ucnl_username is not None or ucnl_password or platform is not None:
         # Credenciales nuevas → descartar la sesión guardada de UCNL
         user = get_user(user_id)
         user.auth_state_path.unlink(missing_ok=True)

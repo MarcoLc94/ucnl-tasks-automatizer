@@ -123,7 +123,26 @@ _MARKDOWN_RULES = """Escribe la respuesta en Markdown usando SOLO estos elemento
 {"tipo": "barras", "titulo": "Título", "etiquetas": ["A", "B", "C"], "series": [{"nombre": "Serie", "valores": [10, 20, 30]}]}
 ```
   (tipo puede ser "barras", "lineas" o "pastel")
-No incluyas portada, nombre del alumno, fecha ni el título de la tarea: eso se agrega automáticamente.
+- Diagramas con un bloque ```diagrama en sintaxis Mermaid. Son OBLIGATORIOS (dentro del contenido, con una
+  breve explicación antes) si la actividad pide diagrama, mapa conceptual, mapa mental, organizador gráfico,
+  cuadro sinóptico, esquema o diagrama de flujo. Reglas para que no falle:
+  ```diagrama
+  flowchart TD
+      A["Tema central"] --> B["Subtema 1"]
+      A --> C["Subtema 2"]
+      B --> D["Detalle"]
+  ```
+  * Empieza con "flowchart TD" (vertical) o "flowchart LR" (horizontal, para procesos o secuencias).
+  * TODOS los textos de nodo van entre comillas dobles: A["Texto"]; sin comillas ni corchetes dentro del texto.
+  * IDs cortos sin acentos ni espacios (A, B, C1…). Máximo 18 nodos y 8 palabras por nodo.
+  * Solo flechas "-->" (o -->|"etiqueta"| ). Puedes agrupar con subgraph S1["Título"] … end.
+  * Mapa conceptual, mapa mental, cuadro sinóptico o "elementos de…": árbol desde un nodo central con 3 a 5
+    ramas y 2 o 3 sub-nodos cada una. Diagrama de flujo o proceso: secuencia de pasos (flowchart LR o TD).
+  * En el texto NUNCA menciones los IDs de los nodos (A, B, C…); refiérete a ellos por su contenido.
+No incluyas portada, índice, nombre del alumno, fecha ni el título de la tarea: eso se agrega automáticamente.
+NUNCA inventes ligas ni URLs de trabajos del alumno. Si la tarea pide un producto hecho en otra plataforma
+(Genially, Canva, Padlet, video, Drive, etc.), en el contenido explica brevemente qué contiene ese producto y
+escribe en una línea propia: **Liga:** [PEGA AQUÍ LA LIGA DE <PLATAFORMA>]
 No uses ningún otro tipo de bloque de código."""
 
 
@@ -147,14 +166,22 @@ def generate_assignment_response(
     task_title: str,
     task_description: str,
     output_format: str = "docx",
+    level: str = "licenciatura",
+    career: str = "",
 ) -> str:
     guide, body, max_tokens = _FORMAT_GUIDE.get(output_format, _FORMAT_GUIDE["docx"])
     if body:  # Trabajos con portada/introducción/contenido/conclusiones/referencias
         guide = f"{guide}\n\n{_STRUCTURE.format(body=body)}"
     from .images import enabled as images_enabled
     image_rule = _IMAGE_RULES.get(output_format, "") if images_enabled() else ""
-    system = f"""Eres un estudiante universitario aplicado de la Universidad Ciudadana de Nuevo León (UCNL)
-cursando Ingeniería en Desarrollo de Software. Debes redactar respuestas académicas completas,
+    if level == "bachillerato":
+        who = ("un estudiante de bachillerato aplicado de la Universidad Ciudadana de Nuevo León (UCNL). "
+               "Escribe con un nivel y vocabulario propios de bachillerato: claro, correcto y sin tecnicismos "
+               "innecesarios")
+    else:
+        who = (f"un estudiante universitario aplicado de la Universidad Ciudadana de Nuevo León (UCNL) "
+               f"cursando {career or 'una licenciatura'}")
+    system = f"""Eres {who}. Debes redactar respuestas académicas completas,
 bien estructuradas y en español. Usa un tono formal pero claro.
 
 {guide}
@@ -178,7 +205,7 @@ def analyze_single_question(course_name: str, question: str, options: list[str])
     """Analyze one exam question in real-time and return the index of the best answer."""
     options_text = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options))
     system = (
-        "Eres un estudiante universitario de Ingeniería en Desarrollo de Software en la UCNL. "
+        "Eres un estudiante aplicado de la UCNL. "
         "Responde la pregunta eligiendo la opción más correcta. "
         "Responde ÚNICAMENTE con el número del índice (0, 1, 2…). Sin texto adicional."
     )
@@ -200,7 +227,7 @@ def analyze_exam(
     questions_raw: list of {question: str, options: list[str], type: "single"|"multiple"}
     Returns: same list with "selected_indices" added to each item.
     """
-    system = """Eres un estudiante universitario de Ingeniería en Desarrollo de Software en la UCNL.
+    system = """Eres un estudiante aplicado de la UCNL.
 Debes responder preguntas de examen correctamente. Analiza cada pregunta con cuidado y elige la(s)
 respuesta(s) más correcta(s). Para preguntas de opción única elige solo una. Para múltiple opción
 puedes elegir varias si corresponde.

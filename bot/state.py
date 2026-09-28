@@ -219,6 +219,17 @@ def update_course_info(task_id: str, course_grade: str | None, teacher: str | No
     return _update(task_id, **fields) if fields else False
 
 
+def find_existing_by_url(user_id: int, task_url: str) -> PendingTask | None:
+    """La URL identifica la actividad sin ambigüedad (dos materias pueden tener una 'Actividad 1')."""
+    if not task_url:
+        return None
+    return _from_row(db.query_one("SELECT * FROM tasks WHERE user_id = ? AND task_url = ?", (user_id, task_url)))
+
+
+def update_names(task_id: str, course_name: str, task_title: str) -> bool:
+    return _update(task_id, course_name=course_name, task_title=task_title)
+
+
 def update_dates(task_id: str, opens_at: str | None, closes_at: str | None) -> bool:
     return _update(task_id, opens_at=opens_at, closes_at=closes_at)
 

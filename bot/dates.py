@@ -14,8 +14,9 @@ _MONTHS = {
 _DATE_RE = re.compile(r"(\d{1,2})\s+de\s+([a-záéíóú]+)\s+de\s+(\d{4})(?:,?\s*(\d{1,2}):(\d{2}))?", re.I)
 
 # Etiquetas que usa Moodle (en la traducción de la UCNL) en el bloque de fechas de la actividad
-_OPEN_LABELS = ("abre", "abiert", "apertura", "disponible desde", "permitir entregas desde")
-_CLOSE_LABELS = ("cierra", "cierre", "pendiente", "fecha de entrega", "vence", "fecha límite", "entrega")
+# Presente y pasado: "Abre/Abrió", "Cierra/Cerró"
+_OPEN_LABELS = ("abre", "abri", "abiert", "apertura", "disponible desde", "permitir entregas desde")
+_CLOSE_LABELS = ("cierra", "cierre", "cerr", "pendiente", "fecha de entrega", "vence", "venci", "fecha límite", "entrega")
 
 
 def now() -> datetime:

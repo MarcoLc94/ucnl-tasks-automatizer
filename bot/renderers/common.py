@@ -1,5 +1,6 @@
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 
 from .markdown import split_sections
 
@@ -14,16 +15,23 @@ class CoverInfo:
     date: str
     grade: str = ""
     teacher: str = ""
+    career_label: str = "Licenciatura"  # "Bachillerato" para alumnos de bachillerato
+    group: str = ""       # aula / grupo, ej. "F"
+    matricula: str = ""
+    place: str = ""       # ej. "Monterrey, Nuevo León"
+    logo: Path | None = None
 
     def fields(self) -> list[tuple[str, str]]:
         """Datos de la portada en orden, omitiendo los vacíos."""
         rows = [
-            ("Licenciatura", self.career),
+            (self.career_label, self.career),
             ("Materia", self.course),
             ("Grado", self.grade),
+            ("Grupo", self.group),
             ("Alumno", self.student),
+            ("Matrícula", self.matricula),
             ("Docente", self.teacher),
-            ("Fecha", self.date),
+            ("Lugar y fecha", f"{self.place}, {self.date}") if self.place else ("Fecha", self.date),
         ]
         return [(k, v) for k, v in rows if v]
 

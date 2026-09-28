@@ -61,9 +61,14 @@ SEL_TASK_STATUS      = ".submissionstatustable, .submission-status"
 SEL_SUBMITTED_TEXT   = "submitted, Entregado, entregado"  # texto a buscar en status
 
 # Formulario de entrega de tarea
-SEL_SUBMIT_BTN       = "input[value*='Agregar entrega'], button:has-text('Agregar entrega'), .btn:has-text('Editar')"
+SEL_SUBMIT_BTN       = (
+    "button:has-text('Añadir envío'), input[value*='Añadir envío'], "
+    "button:has-text('Agregar entrega'), input[value*='Agregar entrega'], "
+    "button:has-text('Editar envío'), input[value*='Editar envío'], "
+    "button:has-text('Add submission'), button:has-text('Edit submission'), .btn:has-text('Editar')"
+)
 SEL_ONLINE_TEXT_AREA = ".editor_atto_content, .atto_content, div[contenteditable='true'], textarea#id_onlinetext_editor"
-SEL_SAVE_BTN         = "input[value*='Guardar'], button:has-text('Guardar'), input[type='submit']"
+SEL_SAVE_BTN         = "input[name='submitbutton'], button[name='submitbutton'], input[value*='Guardar'], button:has-text('Guardar')"
 
 # Examen (quiz)
 SEL_ATTEMPT_BTN      = "button:has-text('Intentar examen'), button:has-text('Intentar cuestionario'), button:has-text('Intentar'), a:has-text('Intentar cuestionario'), .btn-primary:has-text('Intentar')"
@@ -105,6 +110,19 @@ async def browser_session(user: User):
                 await browser.close()
 
 
+async def _goto(page: Page, url: str, attempts: int = 3) -> None:
+    """page.goto con reintentos: la UCNL a veces tarda o no responde por unos segundos."""
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto(url, wait_until="load", timeout=45000)
+            return
+        except Exception as e:
+            if attempt == attempts:
+                raise
+            logger.warning(f"No cargó {url} (intento {attempt}/{attempts}): {str(e).splitlines()[0]} — reintentando")
+            await asyncio.sleep(5 * attempt)
+
+
 async def _new_context(playwright, user: User) -> tuple:
     browser = await playwright.chromium.launch(
         headless=_headless(),
@@ -130,8 +148,7 @@ async def _new_context(playwright, user: User) -> tuple:
 
 
 async def _login(page: Page, context: BrowserContext, user: User) -> bool:
-    cfg = get()["ucnl"]
-    base_url = cfg["base_url"]
+    base_url = user.base_url + "/"
     username = user.ucnl_username
     password = user.ucnl_password
 
@@ -139,7 +156,7 @@ async def _login(page: Page, context: BrowserContext, user: User) -> bool:
         logger.error(f"[{user.username}] No tiene credenciales de UCNL configuradas")
         return False
 
-    await page.goto(base_url, wait_until="load")
+    await _goto(page, base_url)
 
     # Si ya hay sesión activa (auth_state guardado), no necesitamos login
     if await _is_logged_in(page):
@@ -182,12 +199,11 @@ async def _is_logged_in(page: Page) -> bool:
 
 # ─── Scan courses ─────────────────────────────────────────────────────────────
 
-async def get_courses(page: Page) -> list[dict]:
+async def get_courses(page: Page, base_url: str) -> list[dict]:
     """Navigate to 'Mis Cursos' and return list of {name, url} for each course."""
-    cfg = get()["ucnl"]
-    base_url = cfg["base_url"].rstrip("/")
+    base_url = base_url.rstrip("/")
     try:
-        await page.goto(f"{base_url}/my/courses.php", wait_until="load")
+        await _goto(page, f"{base_url}/my/courses.php")
     except Exception as e:
         logger.error(f"Error navegando a Mis Cursos: {e}")
         return []
@@ -199,32 +215,54 @@ async def get_courses(page: Page) -> list[dict]:
     except Exception:
         logger.warning("La lista de cursos no terminó de cargar a tiempo")
 
-    course_links = await page.query_selector_all(SEL_COURSE_LINKS)
+    # Cada tarjeta de curso puede tener varios enlaces (imagen con la categoría + nombre):
+    # se lee la tarjeta completa para no confundir la categoría con el nombre de la materia.
+    raw = await page.evaluate("""() => {
+        const clean = (el) => {
+            if (!el) return '';
+            const c = el.cloneNode(true);
+            c.querySelectorAll('img, .sr-only, .visually-hidden, [data-region="favourite-icon"]').forEach(x => x.remove());
+            return c.innerText.split('\\n').map(l => l.trim())
+                .filter(l => l && !['Imagen del curso', 'Nombre del curso', 'Course image', 'Course name'].includes(l))
+                .join(' ').replace(/^El curso está destacado\\s*/, '').trim();
+        };
+        const out = [];
+        const cards = document.querySelectorAll("[data-region='course-content']");
+        for (const card of cards) {
+            const nameLink = card.querySelector('a.coursename, .coursename a, a.aalink[href*="course/view.php"]')
+                          || [...card.querySelectorAll('a[href*="course/view.php"]')].pop();
+            if (!nameLink) continue;
+            const cat = card.querySelector('.categoryname, .course-category');
+            let name = clean(nameLink.querySelector('.multiline') || nameLink);
+            // Los nombres largos vienen recortados ("…" o "..."); el completo está en el menú de acciones
+            if (/(\\.\\.\\.|…)$/.test(name)) {
+                const menu = card.querySelector('.coursemenubtn .sr-only, .coursemenubtn [title]');
+                const full = menu ? (menu.innerText || menu.getAttribute('title') || '') : '';
+                const m = full.match(/(?:Actions for current course|Acciones para curso actual|Acciones para el curso actual)\\s+(.+)$/);
+                if (m) name = m[1].trim();
+            }
+            out.push({
+                url: nameLink.href,
+                name: name,
+                grade: cat ? cat.innerText.replace('Categoría del curso', '').replace('Course category', '').trim() : '',
+            });
+        }
+        if (!out.length) {  // Otra vista: solo enlaces sueltos
+            for (const a of document.querySelectorAll('a[href*="course/view.php"]')) {
+                out.push({url: a.href, name: clean(a), grade: ''});
+            }
+        }
+        return out;
+    }""")
+
     courses = []
     seen_urls = set()
-    for link in course_links:
-        href = await link.get_attribute("href")
-        if not href or href in seen_urls:
+    for c in raw:
+        if not c["name"] or c["url"] in seen_urls:
             continue
-        # Extraer texto ignorando imágenes y etiquetas genéricas
-        name = await link.evaluate("""el => {
-            const clone = el.cloneNode(true);
-            clone.querySelectorAll('img, .sr-only, .visually-hidden').forEach(i => i.remove());
-            const lines = clone.innerText.split('\\n')
-                .map(l => l.trim())
-                .filter(l => l && l !== 'Imagen del curso' && l !== 'Nombre del curso');
-            return lines.join(' ').replace(/^El curso está destacado\\s*/, '').trim();
-        }""")
-        if name:
-            seen_urls.add(href)
-            # Grado: categoría del curso en la tarjeta (ej. "5to Tetramestre")
-            grade = await link.evaluate("""el => {
-                const card = el.closest("[data-region='course-content']");
-                const cat = card && card.querySelector('.categoryname');
-                return cat ? cat.innerText.replace('Categoría del curso', '').trim() : '';
-            }""")
-            courses.append({"name": name, "url": href, "grade": grade, "teacher": ""})
-            logger.info(f"Curso encontrado: {name} ({grade or 'sin grado'})")
+        seen_urls.add(c["url"])
+        courses.append({"name": c["name"], "url": c["url"], "grade": c["grade"], "teacher": ""})
+        logger.info(f"Curso encontrado: {c['name']} ({c['grade'] or 'sin grado'})")
 
     return courses
 
@@ -235,15 +273,25 @@ async def get_course_teacher(page: Page, course: dict) -> str:
     m = re.search(r"[?&]id=(\d+)", course["url"])
     if not m:
         return ""
-    base_url = get()["ucnl"]["base_url"].rstrip("/")
+    from urllib.parse import urlsplit
+    parts = urlsplit(course["url"])  # mismo sitio que el curso (licenciatura o bachillerato)
+    base_url = f"{parts.scheme}://{parts.netloc}"
     try:
-        await page.goto(f"{base_url}/user/index.php?id={m.group(1)}&perpage=5000", wait_until="load")
+        await _goto(page, f"{base_url}/user/index.php?id={m.group(1)}&perpage=5000")
         names = await page.evaluate("""() => {
             const out = [];
             for (const row of document.querySelectorAll('table#participants tbody tr')) {
                 const cells = [...row.querySelectorAll('td, th')].map(c => c.innerText.trim());
-                if (cells.some(c => c === 'Profesor')) {
-                    const name = cells.find(c => c && !c.startsWith('Seleccionar'));
+                if (cells.some(c => c === 'Profesor' || c === 'Teacher')) {
+                    // Nombre sin las iniciales del avatar (usuarios sin foto)
+                    const link = row.querySelector('a[href*="user/view.php"], a[href*="user/profile.php"]');
+                    let name = '';
+                    if (link) {
+                        const c = link.cloneNode(true);
+                        c.querySelectorAll('.userinitials, img, .sr-only').forEach(x => x.remove());
+                        name = c.innerText.trim();
+                    }
+                    name = name || cells.find(c => c && !c.startsWith('Seleccionar'));
                     if (name && !out.includes(name)) out.push(name);
                 }
             }
@@ -261,7 +309,7 @@ async def get_course_activities(page: Page, course: dict) -> list[dict]:
     Returns: list of {title, url, type: 'assignment'|'quiz'}
     """
     try:
-        await page.goto(course["url"], wait_until="load")
+        await _goto(page, course["url"])
     except Exception as e:
         logger.error(f"Error entrando al curso {course['name']}: {e}")
         return []
@@ -329,7 +377,7 @@ async def get_assignment_details(page: Page, activity: dict) -> dict | None:
     Returns: {description, already_submitted, is_past_due, due_date} or None on error.
     """
     try:
-        await page.goto(activity["url"], wait_until="load")
+        await _goto(page, activity["url"])
     except Exception as e:
         logger.error(f"Error entrando a tarea {activity['title']}: {e}")
         return None
@@ -461,7 +509,7 @@ async def get_quiz_details(page: Page, activity: dict) -> dict:
               "opens_at": None, "closes_at": None}
 
     try:
-        await page.goto(activity["url"], wait_until="load")
+        await _goto(page, activity["url"])
     except Exception as e:
         logger.error(f"Error entrando a examen {activity['title']}: {e}")
         return result
@@ -516,6 +564,7 @@ async def submit_assignment(
     output_format: str = "docx",
     course_grade: str = "",
     teacher: str = "",
+    include_toc: bool = False,
 ) -> bool:
     """Generate the document in the chosen format and upload it to the Moodle assignment."""
     from .renderers import build_document
@@ -529,13 +578,18 @@ async def submit_assignment(
         career=user.career,
         grade=course_grade,
         teacher=teacher,
+        include_toc=include_toc,
+        level=user.level,
+        matricula=user.matricula,
+        place=user.place,
+        site_url=user.base_url,
     )
     try:
         doc_path = await build_document(output_format, **doc_args)
     except Exception as e:
         if output_format == "docx":
             raise
-        logger.error(f"Error generando {output_format} ({e}) — se entregará como Word")
+        logger.exception(f"Error generando {output_format} ({type(e).__name__}: {e}) — se entregará como Word")
         doc_path = await build_document("docx", **doc_args)
 
     async with browser_session(user) as (context, page):
@@ -543,7 +597,7 @@ async def submit_assignment(
             if not await _login(page, context, user):
                 return False
 
-            await page.goto(task_url, wait_until="load")
+            await _goto(page, task_url)
 
             # Click 'Agregar entrega' o 'Editar entrega'
             submit_btn = await page.query_selector(SEL_SUBMIT_BTN)
@@ -578,6 +632,34 @@ async def submit_assignment(
             if save_btn:
                 await save_btn.click()
                 await page.wait_for_load_state("load")
+
+                # Si la entrega queda como borrador, hay que confirmarla con "Enviar tarea"
+                send_btn = await page.query_selector(
+                    "button:has-text('Enviar tarea'), input[value*='Enviar tarea'], button:has-text('Submit assignment')"
+                )
+                if send_btn:
+                    logger.info("La entrega quedó como borrador — confirmando con 'Enviar tarea'")
+                    await send_btn.click()
+                    await page.wait_for_load_state("load")
+                    statement = await page.query_selector("#id_submissionstatement")
+                    if statement and not await statement.is_checked():
+                        await statement.check()
+                    confirm = await page.query_selector("input[name='submitbutton'], button[name='submitbutton']")
+                    if confirm:
+                        await confirm.click()
+                        await page.wait_for_load_state("load")
+
+                # Verificar en la página de estado que la entrega quedó registrada
+                status_text = ""
+                for row in await page.query_selector_all("table.generaltable tr, .submissionstatustable tr"):
+                    status_text += " " + (await row.inner_text()).lower()
+                logger.info(f"Estado en UCNL tras entregar: {' '.join(status_text.split())[:160]}")
+                if uploaded and doc_path.name.lower()[:30] not in status_text:
+                    logger.error(f"Se guardó pero el archivo no aparece en la entrega: {task_url}")
+                    return False
+                if "ninguna tarea" in status_text or "no entregado" in status_text:
+                    logger.error(f"UCNL no muestra la entrega como enviada: {task_url}")
+                    return False
                 logger.info(f"Tarea entregada exitosamente: {task_url}")
                 await context.storage_state(path=str(user.auth_state_path))
                 return True
@@ -591,43 +673,51 @@ async def submit_assignment(
 
 
 async def _upload_file(page: Page, file_path) -> bool:
-    """Upload a file through Moodle's file manager widget."""
+    """
+    Sube un archivo con el selector de archivos de Moodle y ESPERA a que aparezca en la lista
+    antes de devolver True (si no, se podría guardar una entrega sin archivo).
+    """
     from pathlib import Path
     file_path = Path(file_path)
     try:
-        # Buscar input[type=file] directamente (a veces visible)
-        file_input = await page.query_selector("input[type='file']")
-        if file_input:
-            await file_input.set_input_files(str(file_path))
-            await page.wait_for_timeout(1000)
-            return True
-
-        # Moodle file picker: click en "Subir un archivo"
         add_btn = await page.query_selector(
             ".fp-btn-add, button:has-text('Subir un archivo'), a:has-text('Subir un archivo')"
         )
-        if not add_btn:
+        if add_btn:
+            await add_btn.click()
+            await page.wait_for_selector(".fp-repo", timeout=15000)
+            # Asegurar que el repositorio activo sea "Subir un archivo"
+            upload_repo = await page.query_selector(".fp-repo:has-text('Subir un archivo'), .fp-repo:has-text('Upload a file')")
+            if upload_repo and "active" not in (await upload_repo.get_attribute("class") or ""):
+                await upload_repo.click()
+            await page.wait_for_selector(".fp-upload-form input[type='file'], input[name='repo_upload_file']", timeout=15000)
+
+        file_input = await page.query_selector(".fp-upload-form input[type='file'], input[name='repo_upload_file'], input[type='file']")
+        if not file_input:
+            logger.error("No se encontró el campo para subir archivo")
             return False
+        await file_input.set_input_files(str(file_path))
 
-        await add_btn.click()
-        await page.wait_for_timeout(500)
+        upload_btn = await page.query_selector(
+            "button:has-text('Subir este archivo'), .fp-upload-btn, input[value*='Subir este archivo']"
+        )
+        if upload_btn:
+            await upload_btn.click()
 
-        # Dentro del diálogo del file picker
-        file_input = await page.query_selector(".fp-upload-form input[type='file'], input[name='repo_upload_file']")
-        if file_input:
-            await file_input.set_input_files(str(file_path))
-            await page.wait_for_timeout(500)
+        # Si ya existía un archivo con el mismo nombre (reenvío), sobrescribirlo
+        try:
+            overwrite = await page.wait_for_selector(".fp-dlg-butoverwrite", timeout=3000)
+            if overwrite and await overwrite.is_visible():
+                await overwrite.click()
+        except Exception:
+            pass
 
-            # Click "Subir este archivo"
-            upload_btn = await page.query_selector(
-                "button:has-text('Subir este archivo'), .fp-upload-btn, input[value*='Subir este archivo']"
-            )
-            if upload_btn:
-                await upload_btn.click()
-                await page.wait_for_load_state("load")
-                return True
-
-        return False
+        # Esperar a que el archivo aparezca en el administrador de archivos
+        await page.wait_for_selector(
+            f".filemanager .fp-filename:has-text('{file_path.name[:40]}')", timeout=60000,
+        )
+        logger.info(f"Archivo subido: {file_path.name}")
+        return True
     except Exception as e:
         logger.warning(f"Error en _upload_file: {e}")
         return False
@@ -645,8 +735,13 @@ async def submit_quiz(user: User, task_url: str, course_name: str = "") -> bool:
             if not await _login(page, context, user):
                 return False
 
-            await page.goto(task_url, wait_until="load")
+            await _goto(page, task_url)
             await _start_or_resume_attempt(page)
+
+            # Si no hay preguntas, el intento no se inició (examen cerrado, sin intentos, con contraseña…)
+            if not await page.query_selector(SEL_QUESTION_BLOCKS):
+                logger.error(f"No se pudo iniciar el intento (no hay preguntas en pantalla): {page.url}")
+                return False
 
             # Retroceder hasta la primera pregunta
             logger.info("Retrocediendo hasta la pregunta 1...")
@@ -751,7 +846,7 @@ async def run_scan(user: User) -> dict:
             if not await _login(page, context, user):
                 return failed
 
-            courses = await get_courses(page)
+            courses = await get_courses(page, user.base_url)
             if not courses:
                 logger.warning("No se encontraron cursos")
                 return failed

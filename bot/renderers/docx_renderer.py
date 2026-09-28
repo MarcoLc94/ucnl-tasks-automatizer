@@ -2,13 +2,16 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 from ..images import fetch_photo
+from PIL import Image
+
 from .charts import render_chart_png
+from .diagrams import diagram_path
 from .common import CoverInfo, reference_entries, split_document
 from .markdown import inline_runs, parse, plain
 
@@ -17,6 +20,7 @@ PRIMARY = RGBColor(0x1F, 0x3A, 0x5F)
 
 def render_docx(
     markdown_text: str, cover: CoverInfo, path: Path, work_dir: Path, body_image: Path | None = None,
+    include_toc: bool = False,
 ) -> Path:
     """
     Portada → Introducción → Contenido → Conclusiones → Referencias, cada parte en hoja nueva.
@@ -35,6 +39,10 @@ def render_docx(
     _add_cover(doc, cover)
     parts = split_document(parse(markdown_text))
     counter = [0]
+
+    if include_toc:
+        _add_toc(doc, _estimate_toc(parts, body_image is not None))
+        _page_break(doc)
 
     if parts["intro"]:
         doc.add_heading("Introducción", level=1)
@@ -67,6 +75,77 @@ def render_docx(
     return path
 
 
+_WORDS_PER_PAGE = 380
+
+
+def _words(blocks: list[dict]) -> int:
+    total = 0
+    for b in blocks:
+        total += len(b.get("text", "").split()) + sum(len(i.split()) for i in b.get("items", []))
+        if b["type"] == "table":
+            total += 25 * (len(b["rows"]) + 1)
+        if b["type"] in ("chart", "image"):
+            total += 180  # ~ media hoja
+    return total
+
+
+def _estimate_toc(parts: dict, body_is_image: bool) -> list[tuple[str, int]]:
+    """Entradas del índice con número de página estimado (portada = 1, índice = 2)."""
+    entries, page = [], 3
+    if parts["intro"]:
+        entries.append(("Introducción", page))
+        page += max(1, -(-_words(parts["intro"]) // _WORDS_PER_PAGE))
+    if body_is_image:
+        entries.append(("Infografía", page))
+        page += 1
+    else:
+        acc = 0
+        for b in parts["body"]:
+            if b["type"] == "heading" and b["level"] <= 2:
+                entries.append((plain(b["text"]), page + acc // _WORDS_PER_PAGE))
+            acc += _words([b])
+        page += max(1, -(-acc // _WORDS_PER_PAGE)) if parts["body"] else 0
+    if parts["conclusion"]:
+        entries.append(("Conclusiones", page))
+        page += max(1, -(-_words(parts["conclusion"]) // _WORDS_PER_PAGE))
+    if parts["references"]:
+        entries.append(("Referencias", page))
+    return entries
+
+
+def _add_toc(doc, entries: list[tuple[str, int]]):
+    """Índice como campo TOC de Word (se puede actualizar) con las páginas estimadas ya escritas."""
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = title.add_run("Índice")
+    r.bold = True
+    r.font.size = Pt(16)
+    r.font.color.rgb = PRIMARY
+    title.paragraph_format.space_after = Pt(18)
+
+    def fld(run, kind, text=None):
+        if text is None:
+            el = OxmlElement("w:fldChar")
+            el.set(qn("w:fldCharType"), kind)
+        else:
+            el = OxmlElement("w:instrText")
+            el.set(qn("xml:space"), "preserve")
+            el.text = text
+        run._r.append(el)
+
+    for i, (name, page) in enumerate(entries):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(8)
+        p.paragraph_format.tab_stops.add_tab_stop(Inches(6.1), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+        if i == 0:
+            fld(p.add_run(), "begin")
+            fld(p.add_run(), None, 'TOC \\o "1-1" \\h \\z \\u')
+            fld(p.add_run(), "separate")
+        p.add_run(f"{name}\t{page}")
+        if i == len(entries) - 1:
+            fld(p.add_run(), "end")
+
+
 def _page_break(doc):
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
@@ -97,6 +176,15 @@ def _add_blocks(doc, blocks: list[dict], work_dir: Path, counter: list[int]):
                 doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
                 cap = doc.add_paragraph(photo["credit"], style="Caption")
                 cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        elif kind == "diagram":
+            png = diagram_path(block["code"], work_dir)
+            if png.exists():
+                with Image.open(png) as im:
+                    ratio = im.height / im.width
+                # Ancho de página (6.1 in) salvo que quede demasiado alto
+                width = min(6.1, 8.3 / ratio) if ratio > 0 else 6.1
+                doc.add_picture(str(png), width=Inches(width))
+                doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
         elif kind == "chart":
             counter[0] += 1
             png = render_chart_png(block["spec"], work_dir / f"chart_{counter[0]}.png")
@@ -135,14 +223,20 @@ def _add_cover(doc, cover: CoverInfo):
             r.font.color.rgb = color
         return p
 
-    centered(cover.university, 18, bold=True, space_before=12, color=PRIMARY)
-    centered(cover.title, 22, bold=True, space_before=90, color=PRIMARY)
+    if cover.logo:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        with Image.open(cover.logo) as im:
+            ratio = im.width / im.height
+        p.add_run().add_picture(str(cover.logo), width=Inches(min(4.2, 1.6 * ratio)))
+    centered(cover.university, 18, bold=True, space_before=6, color=PRIMARY)
+    centered(cover.title, 22, bold=True, space_before=50 if cover.logo else 90, color=PRIMARY)
 
     first = True
     for label, value in cover.fields():
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_before = Pt(110 if first else 0)
+        p.paragraph_format.space_before = Pt((60 if cover.logo else 110) if first else 0)
         p.paragraph_format.space_after = Pt(6)
         r1 = p.add_run(f"{label}: ")
         r1.bold = True

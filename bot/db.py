@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS users (
     ucnl_username      TEXT NOT NULL DEFAULT '',
     ucnl_password_enc  TEXT NOT NULL DEFAULT '',
     career             TEXT NOT NULL DEFAULT 'Ingeniería en Desarrollo de Software',
+    platform           TEXT NOT NULL DEFAULT 'licenciatura',
+    matricula          TEXT NOT NULL DEFAULT '',
+    place              TEXT NOT NULL DEFAULT 'Monterrey, Nuevo León',
     scan_hour          INTEGER NOT NULL DEFAULT 8,
     scan_minute        INTEGER NOT NULL DEFAULT 0,
     created_at         TEXT NOT NULL
@@ -77,6 +80,12 @@ def _migrate(c: sqlite3.Connection) -> None:
         if col not in cols:
             c.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
     user_cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+    if "matricula" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN matricula TEXT NOT NULL DEFAULT ''")
+    if "place" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN place TEXT NOT NULL DEFAULT 'Monterrey, Nuevo León'")
+    if "platform" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN platform TEXT NOT NULL DEFAULT 'licenciatura'")
     if "career" not in user_cols:
         c.execute("ALTER TABLE users ADD COLUMN career TEXT NOT NULL DEFAULT 'Ingeniería en Desarrollo de Software'")
 
