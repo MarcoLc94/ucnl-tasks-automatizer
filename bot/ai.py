@@ -18,47 +18,70 @@ def _get_client() -> Groq:
 
 
 def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
+    """
+    Llama a Groq. Si el modelo principal agotó su cuota DIARIA, pasa de inmediato a los modelos de respaldo
+    (config bot.fallback_models), cada uno tiene su propia cuota. Límites por minuto: espera y reintenta.
+    """
     global _last_call_time
     from .config import get
     cfg = get()["bot"]
+    models = [cfg["model"]] + [m for m in cfg.get("fallback_models", []) if m != cfg["model"]]
 
-    # Respetar intervalo mínimo entre llamadas
-    elapsed = time.time() - _last_call_time
-    if elapsed < _MIN_INTERVAL:
-        time.sleep(_MIN_INTERVAL - elapsed)
+    last_error = None
+    for model in models:
+        if model in _exhausted_today():
+            continue
+        wait = 15
+        for attempt in range(3):
+            elapsed = time.time() - _last_call_time
+            if elapsed < _MIN_INTERVAL:
+                time.sleep(_MIN_INTERVAL - elapsed)
+            try:
+                _last_call_time = time.time()
+                extra = {}
+                budget = max_tokens
+                if cfg.get("reasoning_effort"):
+                    # Los modelos de razonamiento gastan tokens pensando antes de responder
+                    extra["reasoning_effort"] = cfg["reasoning_effort"]
+                    budget += int(cfg.get("reasoning_budget", 4096))
+                response = _get_client().chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=cfg["temperature"],
+                    max_tokens=budget,
+                    **extra,
+                )
+                content = response.choices[0].message.content or ""
+                # Algunos modelos incluyen su razonamiento entre <think>…</think>
+                return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+            except RateLimitError as e:
+                last_error = e
+                if "per day" in str(e) or "(TPD)" in str(e) or "(RPD)" in str(e):
+                    logger.warning(f"Cuota diaria de Groq agotada para {model} — cambiando de modelo")
+                    _mark_exhausted(model)
+                    break  # siguiente modelo, sin esperar
+                if attempt < 2:
+                    logger.warning(f"Rate limit de Groq ({model}) — esperando {wait}s ({attempt + 1}/3)")
+                    time.sleep(wait)
+                    wait *= 2
+    logger.error("Groq: todos los modelos sin cuota o con límite")
+    raise last_error or RuntimeError("Groq no disponible")
 
-    retries = 3
-    wait = 15  # segundos de espera inicial en 429
-    for attempt in range(retries):
-        try:
-            _last_call_time = time.time()
-            extra = {}
-            if cfg.get("reasoning_effort"):
-                # Los modelos de razonamiento gastan tokens pensando antes de responder:
-                # se les da margen extra para que no corten la respuesta (o la dejen vacía)
-                extra["reasoning_effort"] = cfg["reasoning_effort"]
-                max_tokens += int(cfg.get("reasoning_budget", 4096))
-            response = _get_client().chat.completions.create(
-                model=cfg["model"],
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=cfg["temperature"],
-                max_tokens=max_tokens,
-                **extra,
-            )
-            content = response.choices[0].message.content or ""
-            # Algunos modelos incluyen su razonamiento entre <think>…</think>
-            return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
-        except RateLimitError:
-            if attempt < retries - 1:
-                logger.warning(f"Rate limit de Groq — esperando {wait}s antes de reintentar ({attempt + 1}/{retries})")
-                time.sleep(wait)
-                wait *= 2  # backoff exponencial
-            else:
-                logger.error("Rate limit de Groq agotado tras varios reintentos")
-                raise
+
+_exhausted: dict[str, float] = {}
+
+
+def _exhausted_today() -> set[str]:
+    """Modelos con cuota diaria agotada en las últimas 3 horas (luego se vuelven a probar)."""
+    now = time.time()
+    return {m for m, t in _exhausted.items() if now - t < 3 * 3600}
+
+
+def _mark_exhausted(model: str):
+    _exhausted[model] = time.time()
 
 
 _REF_RULE = """

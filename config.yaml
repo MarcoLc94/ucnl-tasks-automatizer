@@ -1,5 +1,9 @@
 bot:
   model: "openai/gpt-oss-120b"
+  # Si el modelo principal agota su cuota diaria de Groq, se usan estos (cada uno tiene su propia cuota)
+  fallback_models:
+    - "qwen/qwen3.8-27b"
+    - "openai/gpt-oss-20b"
   temperature: 0.5
   max_tokens: 2000
   # Para modelos de razonamiento (gpt-oss, qwen3): low | medium | high
