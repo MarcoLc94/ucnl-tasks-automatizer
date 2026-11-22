@@ -59,7 +59,31 @@ def wants_worksheet(task_description: str, attachments: list[str] | None) -> boo
     if not any(str(a).lower().endswith(".docx") for a in attachments or []):
         return False
     text = _normalize(task_description or "")
-    return bool(re.search(r"\b(descarg|adjunt|contest|resuelve|completa|llena|realiza la actividad)", text))
+    return bool(re.search(
+        r"\b(descarg|adjunt|contest|resuelve|completa|llena|realiza la actividad"
+        r"|utiliza el formato|usa el formato|en el formato|formato (proporcionado|compartido|de la actividad|adjunto))",
+        text,
+    ))
+
+
+def wants_cover(task_description: str) -> bool:
+    """¿Las instrucciones piden portada?"""
+    return "portada" in _normalize(task_description or "")
+
+
+def requested_filename(task_description: str, student_name: str) -> str | None:
+    """
+    Nombre de archivo que pide el profesor, p. ej. "TLR1 - actividad 1 - TU NOMBRE" → "TLR1 - actividad 1 - ANA GONZALEZ".
+    """
+    text = task_description or ""
+    m = re.search(r"nombre (?:del|de tu|para el) archivo[^:\n]*:\s*\n?\s*([^\n]+)", text, re.I)
+    if not m:
+        return None
+    pattern = m.group(1).strip().strip('"“”').strip()
+    if not re.search(r"(tu nombre|nombre)", pattern, re.I) or len(pattern) > 80:
+        return None
+    name = re.sub(r"(tu nombre( completo)?|nombre( del alumno)?)", (student_name or "").upper(), pattern, count=1, flags=re.I)
+    return name.strip() or None
 
 
 def detect_format(task_title: str, task_description: str) -> str:
@@ -113,15 +137,28 @@ async def build_document(
     place: str = "",
     site_url: str = "",
     attachment: str | None = None,
+    add_cover: bool = False,
+    filename: str | None = None,
 ) -> Path:
     fmt = output_format if output_format in FORMATS else "docx"
+    base_name = safe_filename(filename or task_title)
     if fmt == "worksheet":
-        # El Word del profesor con las respuestas escritas en su lugar (sin portada propia)
+        # El Word del profesor con las respuestas escritas en su lugar (portada solo si se pidió)
         if not attachment or not Path(attachment).exists():
             raise RuntimeError("Esta tarea no tiene un Word adjunto para contestar")
         from .worksheet import fill
-        out = Path(output_dir) / f"{safe_filename(task_title)}.docx"
-        _, warnings = fill(Path(attachment), markdown_text, out)
+        out = Path(output_dir) / f"{base_name}.docx"
+        ws_cover = None
+        if add_cover:
+            ws_cover = CoverInfo(
+                university="Universidad Ciudadana de Nuevo León", career=career,
+                course=clean_course_name(course_name), title=task_title, student=student_name,
+                date=spanish_date(), grade=grade, teacher=teacher,
+                career_label="Bachillerato" if level == "bachillerato" else "Licenciatura",
+                group=course_group(course_name), matricula=matricula, place=place,
+                logo=get_site_logo(site_url) if site_url else None,
+            )
+        _, warnings = fill(Path(attachment), markdown_text, out, cover=ws_cover)
         for w in warnings:
             logger.warning(f"Contestar Word: {w}")
         logger.info(f"Documento generado (Word adjunto contestado): {out.name}")
@@ -141,7 +178,7 @@ async def build_document(
         place=place,
         logo=get_site_logo(site_url) if site_url else None,
     )
-    path = Path(output_dir) / f"{safe_filename(task_title)}{_EXTENSIONS[fmt]}"
+    path = Path(output_dir) / f"{base_name}{_EXTENSIONS[fmt]}"
     work_dir = Path(tempfile.mkdtemp(prefix="ucnl_render_"))
     try:
         # Los diagramas se dibujan antes (es asíncrono); los renderizadores solo insertan el PNG

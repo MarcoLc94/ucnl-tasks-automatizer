@@ -21,7 +21,10 @@ from bot import users
 from bot.security import check_secret_key
 from bot.ai import generate_assignment_response, generate_worksheet_answers
 from bot.browser import run_scan, submit_assignment, submit_quiz, browser_session, _login
-from bot.renderers import FORMATS, detect_format, build_document, to_pdf_for_preview, wants_toc, wants_worksheet
+from bot.renderers import (
+    FORMATS, detect_format, build_document, to_pdf_for_preview, wants_toc, wants_worksheet,
+    wants_cover, requested_filename,
+)
 from bot.renderers.worksheet import outline as worksheet_outline
 from bot.dates import status_from_dates
 
@@ -120,6 +123,10 @@ async def _register_item(user: users.User, item: dict) -> bool:
             st.update_names(existing.id, course_name, task_title)
         st.update_dates(existing.id, opens_at, closes_at)
         st.update_course_info(existing.id, course_grade, teacher)
+        # Descripción con los enlaces de las instrucciones (tareas escaneadas antes de guardarlos)
+        if kind == "assignment" and "Enlaces en las instrucciones:" in data.get("description", "") \
+                and "Enlaces en las instrucciones:" not in (existing.task_description or ""):
+            st.update_description(existing.id, data["description"])
         attachments = data.get("attachments") or []
         if kind == "assignment" and attachments and not existing.attachment_path:
             st.update_attachment(existing.id, attachments[0])
@@ -180,17 +187,19 @@ async def _register_item(user: users.User, item: dict) -> bool:
 
 async def _compose_response(user: users.User, task: st.PendingTask, output_format: str) -> str:
     """Genera el contenido con la IA según el formato (Word adjunto contestado o trabajo nuevo)."""
+    from bot.reader import reference_texts
+    references = await run_in_threadpool(reference_texts, task.task_description)
     if output_format == "worksheet":
         if not task.attachment_path or not Path(task.attachment_path).exists():
             raise HTTPException(status_code=400, detail="Esta tarea no tiene un Word adjunto para contestar")
         doc_outline = await run_in_threadpool(worksheet_outline, Path(task.attachment_path))
         return await run_in_threadpool(
             generate_worksheet_answers, task.course_name, task.task_title, task.task_description,
-            doc_outline, user.level, user.display_name, user.place,
+            doc_outline, user.level, user.display_name, user.place, references,
         )
     return await run_in_threadpool(
         generate_assignment_response, task.course_name, task.task_title, task.task_description,
-        output_format, user.level, user.career,
+        output_format, user.level, user.career, references,
     )
 
 
@@ -449,6 +458,8 @@ async def preview_document(task_id: str, body: DocumentRequest, user: users.User
             place=user.place,
             site_url=user.base_url,
             attachment=task.attachment_path,
+            add_cover=wants_cover(task.task_description),
+            filename=requested_filename(task.task_description, user.display_name),
         )
     except Exception as e:
         logger.exception(f"Error generando vista previa de {task_id} ({body.output_format or task.output_format})")
@@ -577,6 +588,8 @@ async def _submit_task(task_id: str):
                 teacher=task.teacher or "",
                 include_toc=wants_toc(task.task_description),
                 attachment=task.attachment_path,
+                add_cover=wants_cover(task.task_description),
+                filename=requested_filename(task.task_description, user.display_name),
             )
         else:
             ok = await submit_quiz(user, task.task_url, course_name=task.course_name)

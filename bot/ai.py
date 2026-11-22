@@ -61,6 +61,14 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
                 raise
 
 
+_REF_RULE = """
+
+TEXTOS DE REFERENCIA (contenido real descargado de los enlaces de la actividad):
+{references}
+
+Si la actividad pide elegir/leer un texto, elige SOLO entre estos textos de referencia y basa TODO (resumen,
+análisis, opinión, respuestas) en lo que realmente dicen. No inventes hechos que no estén en el texto."""
+
 _STRUCTURE = """ESTRUCTURA OBLIGATORIA (en este orden, con estos títulos exactos):
 ## Introducción
   Mínimo 230 palabras en 2 o 3 párrafos de prosa (sin viñetas): contexto del tema, su importancia y
@@ -168,6 +176,7 @@ def generate_assignment_response(
     output_format: str = "docx",
     level: str = "licenciatura",
     career: str = "",
+    references: str = "",
 ) -> str:
     guide, body, max_tokens = _FORMAT_GUIDE.get(output_format, _FORMAT_GUIDE["docx"])
     if body:  # Trabajos con portada/introducción/contenido/conclusiones/referencias
@@ -194,6 +203,7 @@ Tarea: {task_title}
 
 Instrucciones de la tarea:
 {task_description}
+{_REF_RULE.format(references=references) if references else ""}
 
 Redacta el contenido completo para esta tarea."""
 
@@ -273,6 +283,7 @@ def generate_worksheet_answers(
     level: str = "licenciatura",
     student_name: str = "",
     place: str = "",
+    references: str = "",
 ) -> str:
     """Respuestas para una actividad que se contesta sobre el Word del profesor (ver renderers/worksheet.py)."""
     nivel = "bachillerato" if level == "bachillerato" else "licenciatura"
@@ -286,8 +297,25 @@ Contesta TODO lo que pide el documento, en el idioma que pida cada ejercicio, co
 [T0 R1 C2] texto para esa celda
 [P43] SUBRAYAR: texto exacto de la opción correcta tal como aparece en el párrafo
 [DESPUÉS P5] texto que va en un párrafo nuevo justo después de P5 (para redacciones sin línea en blanco)
+[P3] MARCAR   (marca la casilla ☐ de ESE párrafo; usa el número del párrafo de la casilla, no el de la pregunta,
+              y una línea por cada casilla que se deba marcar)
+[P37] REEMPLAZAR: texto que sustituye por completo al del párrafo (p. ej. "Título del texto elegido")
+[INICIO] secciones nuevas al principio (p. ej. "## Introducción" y su texto en líneas siguientes)
+[FINAL] secciones nuevas al final (p. ej. "## Conclusión", "## Referencias")
 
 Reglas:
+- Si un párrafo es un marcador como "Haga clic o pulse aquí para escribir texto." o "Borra esto y coloca aquí…",
+  escribe la respuesta con [P#] de ESE párrafo (no el de la pregunta): el marcador se reemplaza.
+- Da UNA sola respuesta por pregunta.
+- Si las instrucciones piden secciones que el documento no trae (introducción, conclusión, opinión, referencias),
+  agrégalas con [INICIO] o [FINAL] respetando la extensión pedida (cuenta palabras cuando den mínimo/máximo).
+- Si hay que elegir entre varias opciones (un texto, un tema), elige SOLO una cuyo contenido conozcas con
+  certeza (trama, personajes, ideas principales). Tu análisis debe referirse a ese contenido concreto, no a
+  generalidades. Menciona título y autor donde se pida.
+- Sé coherente: lo que digas en las redacciones debe coincidir con las casillas que marcas (si dices que usaste
+  el diccionario, marca "Uso de diccionario"), y viceversa.
+- Respeta estrictamente los límites de palabras (p. ej. 150 a 200): apunta al punto medio.
+- Para secciones nuevas usa títulos con "## " (p. ej. "## Introducción") y el texto en la línea siguiente.
 - Si un párrafo tiene varios espacios "____", separa las respuestas con " | " en el orden en que aparecen.
 - Para redacciones largas escribe varias oraciones en la misma línea.
 - Para "subraya/selecciona/elige la correcta" usa SUBRAYAR con el texto exacto de la opción.
@@ -303,7 +331,8 @@ Instrucciones en la plataforma:
 {task_description}
 
 Contenido del documento:
-{document_outline}"""
+{document_outline}
+{_REF_RULE.format(references=references) if references else ""}"""
 
     logger.info(f"Generando respuestas para Word adjunto: {task_title}")
     return _chat(system, user, max_tokens=3000)

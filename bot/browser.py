@@ -117,6 +117,10 @@ async def _goto(page: Page, url: str, attempts: int = 3) -> None:
             await page.goto(url, wait_until="load", timeout=45000)
             return
         except Exception as e:
+            if "has been closed" in str(e):
+                # Alguien cerró la ventana del navegador (modo visible): reintentar no sirve
+                raise RuntimeError("Se cerró la ventana del navegador del bot. Vuelve a intentarlo sin cerrarla "
+                                   "(o activa HEADLESS=true en .env para que trabaje oculto).") from e
             if attempt == attempts:
                 raise
             logger.warning(f"No cargó {url} (intento {attempt}/{attempts}): {str(e).splitlines()[0]} — reintentando")
@@ -451,6 +455,23 @@ async def get_assignment_details(page: Page, activity: dict, attachments_dir: Pa
         content_el = await page.query_selector("#region-main, .course-content, main")
         description = (await content_el.inner_text()).strip() if content_el else ""
 
+    # Enlaces dentro de las instrucciones (textos para leer, recursos…) se agregan a la descripción
+    from .reader import append_links
+    try:
+        links = await page.eval_on_selector_all(
+            "#intro a[href], .activity-description a[href], .box.generalbox a[href]",
+            "els => els.map(e => [(e.closest('p,li') || e).innerText.trim(), e.href])"
+                ".filter(([t, h]) => h.startsWith('http') && !h.includes('pluginfile.php') && !h.includes('/mod/') && !h.includes('/course/'))",
+        )
+        seen, unique = set(), []
+        for ctx, href in links:
+            if href not in seen:
+                seen.add(href)
+                unique.append((ctx.replace("\n", " "), href))
+        description = append_links(description, unique)
+    except Exception as e:
+        logger.warning(f"No se pudieron leer los enlaces de {activity['title']}: {e}")
+
     return {
         "attachments": await _download_attachments(page, activity, attachments_dir),
         "description": description,
@@ -599,6 +620,8 @@ async def submit_assignment(
     teacher: str = "",
     include_toc: bool = False,
     attachment: str | None = None,
+    add_cover: bool = False,
+    filename: str | None = None,
 ) -> bool:
     """Generate the document in the chosen format and upload it to the Moodle assignment."""
     from .renderers import build_document
@@ -618,6 +641,8 @@ async def submit_assignment(
         place=user.place,
         site_url=user.base_url,
         attachment=attachment,
+        add_cover=add_cover,
+        filename=filename,
     )
     try:
         doc_path = await build_document(output_format, **doc_args)
@@ -715,29 +740,53 @@ async def _upload_file(page: Page, file_path) -> bool:
     from pathlib import Path
     file_path = Path(file_path)
     try:
-        add_btn = await page.query_selector(
-            ".fp-btn-add, button:has-text('Subir un archivo'), a:has-text('Subir un archivo')"
-        )
-        if add_btn:
-            await add_btn.click()
+        # El administrador de archivos se inicializa por JS y redibuja sus botones: esperar a que termine
+        try:
+            await page.wait_for_selector(".filemanager.fm-loaded", timeout=20000)
+        except Exception:
+            logger.warning("El administrador de archivos no reportó fm-loaded — se intenta de todos modos")
+
+        # Locators (se vuelven a buscar en cada intento) en vez de handles que pueden quedar obsoletos
+        dialog = ".moodle-dialogue-base:not(.moodle-dialogue-hidden)"
+        add_btn = page.locator(".filemanager .fp-btn-add, button:has-text('Subir un archivo'), a:has-text('Subir un archivo')").first
+        if await add_btn.count():
+            await add_btn.click(timeout=15000)
             await page.wait_for_selector(".fp-repo", timeout=15000)
-            # Asegurar que el repositorio activo sea "Subir un archivo"
-            upload_repo = await page.query_selector(".fp-repo:has-text('Subir un archivo'), .fp-repo:has-text('Upload a file')")
-            if upload_repo and "active" not in (await upload_repo.get_attribute("class") or ""):
-                await upload_repo.click()
-            await page.wait_for_selector(".fp-upload-form input[type='file'], input[name='repo_upload_file']", timeout=15000)
+            # Ir al repositorio "Subir un archivo" solo si no es el que ya se muestra
+            # (hacer clic de más redibuja el formulario y se pierde el archivo elegido)
+            form_sel = f"{dialog} .fp-upload-form input[type='file'], input[name='repo_upload_file']"
+            form_visible = await page.locator(form_sel).count()
+            if not form_visible:
+                await page.locator(".fp-repo:has-text('Subir un archivo'), .fp-repo:has-text('Upload a file')").first.click(timeout=10000)
+            await page.wait_for_selector(form_sel, state="attached", timeout=15000)
+            await page.wait_for_timeout(800)  # dejar que el formulario termine de dibujarse
 
-        file_input = await page.query_selector(".fp-upload-form input[type='file'], input[name='repo_upload_file'], input[type='file']")
-        if not file_input:
-            logger.error("No se encontró el campo para subir archivo")
-            return False
-        await file_input.set_input_files(str(file_path))
-
-        upload_btn = await page.query_selector(
-            "button:has-text('Subir este archivo'), .fp-upload-btn, input[value*='Subir este archivo']"
-        )
-        if upload_btn:
-            await upload_btn.click()
+        file_input = page.locator(
+            f"{dialog} .fp-upload-form input[type='file'], input[name='repo_upload_file']"
+        ).first
+        upload_btn = page.locator(
+            f"{dialog} .fp-upload-btn, button:has-text('Subir este archivo'), button:has-text('Upload this file')"
+        ).first
+        for attempt in range(1, 3):
+            await file_input.set_input_files(str(file_path))
+            if not await file_input.evaluate("e => e.files && e.files.length"):
+                logger.warning("El archivo no quedó seleccionado — reintentando")
+                await page.wait_for_timeout(1000)
+                continue
+            await upload_btn.click(timeout=15000)
+            # ¿Moodle respondió "No se han adjuntado archivos"? Cerrar el aviso y reintentar
+            error_ok = page.locator(f"{dialog} button:has-text('OK'), {dialog} button:has-text('Aceptar')").first
+            try:
+                await error_ok.wait_for(state="visible", timeout=2500)
+                msg = await page.locator(f"{dialog} .moodle-dialogue-bd").last.inner_text()
+                if "adjunt" in msg.lower() or "attached" in msg.lower():
+                    logger.warning(f"Moodle: {msg.strip()[:80]} — reintentando ({attempt}/2)")
+                    await error_ok.click()
+                    await page.wait_for_timeout(1000)
+                    continue
+            except Exception:
+                pass
+            break
 
         # Si ya existía un archivo con el mismo nombre (reenvío), sobrescribirlo
         try:
@@ -756,6 +805,27 @@ async def _upload_file(page: Page, file_path) -> bool:
     except Exception as e:
         logger.warning(f"Error en _upload_file: {e}")
         return False
+
+
+async def _quiz_nav(page: Page, selector: str, js_selector: str) -> bool:
+    """
+    Pulsa "Página siguiente/anterior" del examen. Si el clic normal no responde (algo encima, guardado
+    automático…), lo pulsa por JavaScript. Devuelve False si no hay botón.
+    """
+    btn = page.locator(selector).first
+    if not await btn.count():
+        return False
+    try:
+        async with page.expect_navigation(wait_until="load", timeout=45000):
+            try:
+                await btn.click(timeout=10000)
+            except Exception as e:
+                logger.warning(f"Clic normal falló ({str(e).splitlines()[0][:80]}) — pulsando por JavaScript")
+                await page.evaluate("(sel) => { const b = document.querySelector(sel); if (b) b.click(); }", js_selector)
+    except Exception as e:
+        logger.warning(f"La página del examen no cambió tras pulsar {js_selector}: {str(e).splitlines()[0][:80]}")
+        await page.wait_for_load_state("load")
+    return True
 
 
 async def submit_quiz(user: User, task_url: str, course_name: str = "") -> bool:
@@ -781,11 +851,8 @@ async def submit_quiz(user: User, task_url: str, course_name: str = "") -> bool:
             # Retroceder hasta la primera pregunta
             logger.info("Retrocediendo hasta la pregunta 1...")
             for _ in range(100):
-                prev_btn = await page.query_selector(SEL_PREV_BTN)
-                if not prev_btn:
+                if not await _quiz_nav(page, SEL_PREV_BTN, "input[name='previous'], button[name='previous']"):
                     break
-                await prev_btn.click()
-                await page.wait_for_load_state("load")
             logger.info("En la primera pregunta — comenzando respuestas")
 
             # Contestar pregunta por pregunta hacia adelante
@@ -819,11 +886,7 @@ async def submit_quiz(user: User, task_url: str, course_name: str = "") -> bool:
                     except Exception as e:
                         logger.warning(f"Error respondiendo pregunta: {e}")
 
-                next_btn = await page.query_selector(SEL_NEXT_BTN)
-                if next_btn:
-                    await next_btn.click()
-                    await page.wait_for_load_state("load")
-                else:
+                if not await _quiz_nav(page, SEL_NEXT_BTN, "input[name='next'], button[name='next']"):
                     break
 
             logger.info(f"Total preguntas respondidas: {answered}")
