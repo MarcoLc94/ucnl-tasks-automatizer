@@ -1,17 +1,20 @@
 bot:
-  model: "llama-3.3-70b-versatile"
+  model: "openai/gpt-oss-120b"
   temperature: 0.5
   max_tokens: 2000
+  # Para modelos de razonamiento (gpt-oss, qwen3): low | medium | high
+  reasoning_effort: "medium"
+  # Tokens extra que se reservan para el razonamiento además de la respuesta
+  reasoning_budget: 4096
 
 scheduler:
-  scan_hour: 8
-  scan_minute: 0
+  # La hora del escaneo diario ahora es por usuario (panel → Mi cuenta)
   timezone: "America/Monterrey"
 
 ucnl:
-  base_url: "http://licenciatura.ucnl.edu.mx/"
-  auth_state_file: ".auth_state.json"
+  # Plataforma por usuario (se elige en "Mi cuenta")
+  platforms:
+    licenciatura: "https://licenciatura.ucnl.edu.mx/"
+    bachillerato: "https://bachillerato.ucnl.edu.mx/"
+  base_url: "https://licenciatura.ucnl.edu.mx/"  # por defecto y para scan_debug
   headless: false
-
-student:
-  name: "Marco Antonio Lopez Castro"

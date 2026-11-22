@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 from groq import Groq, RateLimitError
@@ -31,6 +32,12 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
     for attempt in range(retries):
         try:
             _last_call_time = time.time()
+            extra = {}
+            if cfg.get("reasoning_effort"):
+                # Los modelos de razonamiento gastan tokens pensando antes de responder:
+                # se les da margen extra para que no corten la respuesta (o la dejen vacía)
+                extra["reasoning_effort"] = cfg["reasoning_effort"]
+                max_tokens += int(cfg.get("reasoning_budget", 4096))
             response = _get_client().chat.completions.create(
                 model=cfg["model"],
                 messages=[
@@ -39,8 +46,11 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
                 ],
                 temperature=cfg["temperature"],
                 max_tokens=max_tokens,
+                **extra,
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content or ""
+            # Algunos modelos incluyen su razonamiento entre <think>…</think>
+            return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
         except RateLimitError:
             if attempt < retries - 1:
                 logger.warning(f"Rate limit de Groq — esperando {wait}s antes de reintentar ({attempt + 1}/{retries})")
@@ -51,33 +61,161 @@ def _chat(system: str, user: str, max_tokens: int = 2000) -> str:
                 raise
 
 
+_REF_RULE = """
+
+TEXTOS DE REFERENCIA (contenido real descargado de los enlaces de la actividad):
+{references}
+
+Si la actividad pide elegir/leer un texto, elige SOLO entre estos textos de referencia y basa TODO (resumen,
+análisis, opinión, respuestas) en lo que realmente dicen. No inventes hechos que no estén en el texto."""
+
+_STRUCTURE = """ESTRUCTURA OBLIGATORIA (en este orden, con estos títulos exactos):
+## Introducción
+  Mínimo 230 palabras en 2 o 3 párrafos de prosa (sin viñetas): contexto del tema, su importancia y
+  qué se abordará en el trabajo.
+{body}
+## Conclusiones
+  Mínimo 180 palabras en 2 párrafos de prosa: síntesis de lo aprendido y reflexión personal.
+## Referencias
+  Lista con "- " de 3 a 6 fichas bibliográficas en formato APA 7 (Autor, A. (Año). *Título*. Editorial o
+  sitio. URL si aplica). Usa SOLO obras, organismos y sitios reales y reconocidos; no inventes autores,
+  títulos ni URLs. Si no estás seguro de una URL, omítela."""
+
+_FORMAT_GUIDE = {
+    "docx": (
+        "El resultado será un trabajo académico en Word.",
+        "## (secciones del contenido)\n  De 3 a 6 secciones '##' con párrafos bien argumentados "
+        "(y '###' si hace falta), respondiendo todo lo que piden las instrucciones.",
+        4500,
+    ),
+    "pdf": (
+        "El resultado será un trabajo académico en PDF.",
+        "## (secciones del contenido)\n  De 3 a 6 secciones '##' con párrafos bien argumentados "
+        "(y '###' si hace falta), respondiendo todo lo que piden las instrucciones.",
+        4500,
+    ),
+    "pptx": (
+        "El resultado será una presentación de PowerPoint: cada sección '##' se convierte en diapositivas.",
+        "## (secciones del contenido)\n  De 5 a 8 secciones '##', cada una con 3 a 5 viñetas breves "
+        "(máximo 20 palabras cada una), sin párrafos largos.",
+        4000,
+    ),
+    "infografia": (
+        "El resultado será un Word cuyo contenido principal es una INFOGRAFÍA de una página (cartel) "
+        "muy visual y con poco texto. El tema es el de la actividad: no hables de las herramientas para "
+        "hacerla (Canva, Piktochart, etc.) ni de las instrucciones de entrega.",
+        "## (secciones de la infografía)\n  De 4 a 6 secciones '##'; cada título empieza con un emoji "
+        "relacionado (ej. '## 🌱 Energías limpias'). Cada una con máximo 3 viñetas de 12 palabras o "
+        "menos. Incluye 2 o 3 cifras clave con el formato '> **cifra** explicación breve' SOLO si son "
+        "datos reales y conocidos (nunca inventes cifras) y, si hay datos reales comparables, UNA "
+        "gráfica. Máximo 220 palabras en esta parte.",
+        4000,
+    ),
+    "triptico": (
+        "El resultado será un tríptico (folleto de 6 paneles). Usa de 5 a 7 secciones '##' cortas y "
+        "llamativas, con frases concisas y viñetas. En total no más de 450 palabras. La última sección "
+        "debe ser un cierre (conclusión, datos clave o recomendaciones).",
+        None,
+        2000,
+    ),
+}
+
+_MARKDOWN_RULES = """Escribe la respuesta en Markdown usando SOLO estos elementos:
+- "## Título de sección" y "### Subtítulo"
+- Párrafos normales, **negritas** y *cursivas*
+- Listas con "- " o "1. "
+- Cifras o frases destacadas con "> **dato** explicación"
+- Tablas Markdown (| col | col | con fila separadora |---|---|) cuando comparar información ayude
+- Gráficas, SOLO si la tarea lo pide o si hay datos reales y conocidos que graficar (nunca inventes estadísticas), con este bloque exacto:
+```grafica
+{"tipo": "barras", "titulo": "Título", "etiquetas": ["A", "B", "C"], "series": [{"nombre": "Serie", "valores": [10, 20, 30]}]}
+```
+  (tipo puede ser "barras", "lineas" o "pastel")
+- Diagramas con un bloque ```diagrama en sintaxis Mermaid. Son OBLIGATORIOS (dentro del contenido, con una
+  breve explicación antes) si la actividad pide diagrama, mapa conceptual, mapa mental, organizador gráfico,
+  cuadro sinóptico, esquema o diagrama de flujo. Reglas para que no falle:
+  ```diagrama
+  flowchart TD
+      A["Tema central"] --> B["Subtema 1"]
+      A --> C["Subtema 2"]
+      B --> D["Detalle"]
+  ```
+  * Empieza con "flowchart TD" (vertical) o "flowchart LR" (horizontal, para procesos o secuencias).
+  * TODOS los textos de nodo van entre comillas dobles: A["Texto"]; sin comillas ni corchetes dentro del texto.
+  * IDs cortos sin acentos ni espacios (A, B, C1…). Máximo 18 nodos y 8 palabras por nodo.
+  * Solo flechas "-->" (o -->|"etiqueta"| ). Puedes agrupar con subgraph S1["Título"] … end.
+  * Mapa conceptual, mapa mental, cuadro sinóptico o "elementos de…": árbol desde un nodo central con 3 a 5
+    ramas y 2 o 3 sub-nodos cada una. Diagrama de flujo o proceso: secuencia de pasos (flowchart LR o TD).
+  * En el texto NUNCA menciones los IDs de los nodos (A, B, C…); refiérete a ellos por su contenido.
+No incluyas portada, índice, nombre del alumno, fecha ni el título de la tarea: eso se agrega automáticamente.
+NUNCA inventes ligas ni URLs de trabajos del alumno. Si la tarea pide un producto hecho en otra plataforma
+(Genially, Canva, Padlet, video, Drive, etc.), en el contenido explica brevemente qué contiene ese producto y
+escribe en una línea propia: **Liga:** [PEGA AQUÍ LA LIGA DE <PLATAFORMA>]
+No uses ningún otro tipo de bloque de código."""
+
+
+_IMAGE_RULE_BASE = (
+    "Puedes incluir fotos con una línea propia así: ![descripción concreta de la foto](imagen). "
+    "La descripción se usa para buscar una foto de stock: describe algo fotografiable y concreto "
+    "(ej. 'paneles solares en un techo', 'personas reciclando plástico'), nunca diagramas, gráficas, "
+    "logotipos ni texto. "
+)
+_IMAGE_RULES = {
+    "docx": _IMAGE_RULE_BASE + "Usa 1 o 2 fotos en total, dentro de las secciones del contenido.",
+    "pdf": _IMAGE_RULE_BASE + "Usa 1 o 2 fotos en total, dentro de las secciones del contenido.",
+    "pptx": _IMAGE_RULE_BASE + "Pon una foto en 3 o 4 de las secciones (al inicio de la sección).",
+    "triptico": _IMAGE_RULE_BASE + "Usa 1 o 2 fotos en total.",
+    "infografia": _IMAGE_RULE_BASE + "Usa exactamente 1 foto (será el fondo del encabezado de la infografía), al inicio de la primera sección de la infografía.",
+}
+
+
 def generate_assignment_response(
     course_name: str,
     task_title: str,
     task_description: str,
+    output_format: str = "docx",
+    level: str = "licenciatura",
+    career: str = "",
+    references: str = "",
 ) -> str:
-    system = """Eres un estudiante universitario aplicado de la Universidad Ciudadana de Nuevo León (UCNL)
-cursando Ingeniería en Desarrollo de Software. Debes redactar respuestas académicas completas,
-bien estructuradas y en español. Usa un tono formal pero claro. Responde directamente al contenido
-de la tarea sin agregar encabezados innecesarios."""
+    guide, body, max_tokens = _FORMAT_GUIDE.get(output_format, _FORMAT_GUIDE["docx"])
+    if body:  # Trabajos con portada/introducción/contenido/conclusiones/referencias
+        guide = f"{guide}\n\n{_STRUCTURE.format(body=body)}"
+    from .images import enabled as images_enabled
+    image_rule = _IMAGE_RULES.get(output_format, "") if images_enabled() else ""
+    if level == "bachillerato":
+        who = ("un estudiante de bachillerato aplicado de la Universidad Ciudadana de Nuevo León (UCNL). "
+               "Escribe con un nivel y vocabulario propios de bachillerato: claro, correcto y sin tecnicismos "
+               "innecesarios")
+    else:
+        who = (f"un estudiante universitario aplicado de la Universidad Ciudadana de Nuevo León (UCNL) "
+               f"cursando {career or 'una licenciatura'}")
+    system = f"""Eres {who}. Debes redactar respuestas académicas completas,
+bien estructuradas y en español. Usa un tono formal pero claro.
+
+{guide}
+
+{_MARKDOWN_RULES}
+{image_rule}"""
 
     user = f"""Materia: {course_name}
 Tarea: {task_title}
 
 Instrucciones de la tarea:
 {task_description}
+{_REF_RULE.format(references=references) if references else ""}
 
-Redacta una respuesta completa y bien argumentada para esta tarea."""
+Redacta el contenido completo para esta tarea."""
 
-    logger.info(f"Generando respuesta IA para tarea: {task_title}")
-    return _chat(system, user)
+    logger.info(f"Generando respuesta IA ({output_format}) para tarea: {task_title}")
+    return _chat(system, user, max_tokens=max_tokens)
 
 
 def analyze_single_question(course_name: str, question: str, options: list[str]) -> int:
     """Analyze one exam question in real-time and return the index of the best answer."""
     options_text = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options))
     system = (
-        "Eres un estudiante universitario de Ingeniería en Desarrollo de Software en la UCNL. "
+        "Eres un estudiante aplicado de la UCNL. "
         "Responde la pregunta eligiendo la opción más correcta. "
         "Responde ÚNICAMENTE con el número del índice (0, 1, 2…). Sin texto adicional."
     )
@@ -99,7 +237,7 @@ def analyze_exam(
     questions_raw: list of {question: str, options: list[str], type: "single"|"multiple"}
     Returns: same list with "selected_indices" added to each item.
     """
-    system = """Eres un estudiante universitario de Ingeniería en Desarrollo de Software en la UCNL.
+    system = """Eres un estudiante aplicado de la UCNL.
 Debes responder preguntas de examen correctamente. Analiza cada pregunta con cuidado y elige la(s)
 respuesta(s) más correcta(s). Para preguntas de opción única elige solo una. Para múltiple opción
 puedes elegir varias si corresponde.
@@ -135,3 +273,66 @@ Responde el examen en formato JSON."""
         for q in questions_raw:
             q["selected_indices"] = [0]
         return questions_raw
+
+
+def generate_worksheet_answers(
+    course_name: str,
+    task_title: str,
+    task_description: str,
+    document_outline: str,
+    level: str = "licenciatura",
+    student_name: str = "",
+    place: str = "",
+    references: str = "",
+) -> str:
+    """Respuestas para una actividad que se contesta sobre el Word del profesor (ver renderers/worksheet.py)."""
+    nivel = "bachillerato" if level == "bachillerato" else "licenciatura"
+    system = f"""Eres un estudiante aplicado de {nivel} de la UCNL. Vas a contestar una actividad que viene en un
+documento de Word. Te doy su contenido con marcas de ubicación: [P#] son párrafos y [T# R# C#] celdas de tabla
+("(vacía)" = celda por llenar; "____" = espacio en blanco).
+
+Contesta TODO lo que pide el documento, en el idioma que pida cada ejercicio, con este formato EXACTO
+(una respuesta por línea, sin nada más):
+[P7] texto que va en el espacio en blanco de ese párrafo
+[T0 R1 C2] texto para esa celda
+[P43] SUBRAYAR: texto exacto de la opción correcta tal como aparece en el párrafo
+[DESPUÉS P5] texto que va en un párrafo nuevo justo después de P5 (para redacciones sin línea en blanco)
+[P3] MARCAR   (marca la casilla ☐ de ESE párrafo; usa el número del párrafo de la casilla, no el de la pregunta,
+              y una línea por cada casilla que se deba marcar)
+[P37] REEMPLAZAR: texto que sustituye por completo al del párrafo (p. ej. "Título del texto elegido")
+[INICIO] secciones nuevas al principio (p. ej. "## Introducción" y su texto en líneas siguientes)
+[FINAL] secciones nuevas al final (p. ej. "## Conclusión", "## Referencias")
+
+Reglas:
+- Si un párrafo es un marcador como "Haga clic o pulse aquí para escribir texto." o "Borra esto y coloca aquí…",
+  escribe la respuesta con [P#] de ESE párrafo (no el de la pregunta): el marcador se reemplaza.
+- Da UNA sola respuesta por pregunta.
+- Si las instrucciones piden secciones que el documento no trae (introducción, conclusión, opinión, referencias),
+  agrégalas con [INICIO] o [FINAL] respetando la extensión pedida (cuenta palabras cuando den mínimo/máximo).
+- Si hay que elegir entre varias opciones (un texto, un tema), elige SOLO una cuyo contenido conozcas con
+  certeza (trama, personajes, ideas principales). Tu análisis debe referirse a ese contenido concreto, no a
+  generalidades. Menciona título y autor donde se pida.
+- Sé coherente: lo que digas en las redacciones debe coincidir con las casillas que marcas (si dices que usaste
+  el diccionario, marca "Uso de diccionario"), y viceversa.
+- Respeta estrictamente los límites de palabras (p. ej. 150 a 200): apunta al punto medio.
+- Para secciones nuevas usa títulos con "## " (p. ej. "## Introducción") y el texto en la línea siguiente.
+- Si un párrafo tiene varios espacios "____", separa las respuestas con " | " en el orden en que aparecen.
+- Para redacciones largas escribe varias oraciones en la misma línea.
+- Para "subraya/selecciona/elige la correcta" usa SUBRAYAR con el texto exacto de la opción.
+- Datos del alumno que SÍ conoces: nombre = {student_name or "(desconocido)"}; ciudad = {place or "(desconocida)"}.
+- Datos personales que NO conoces (edad, dirección, teléfono, cumpleaños, familia, gustos…): escribe
+  [COMPLETA: descripción corta], por ejemplo "I am [COMPLETA: tu edad] years old". Nunca los inventes.
+- No contestes instrucciones, títulos ni encabezados; solo lo que se debe responder."""
+
+    user = f"""Materia: {course_name}
+Actividad: {task_title}
+
+Instrucciones en la plataforma:
+{task_description}
+
+Contenido del documento:
+{document_outline}
+{_REF_RULE.format(references=references) if references else ""}"""
+
+    logger.info(f"Generando respuestas para Word adjunto: {task_title}")
+    return _chat(system, user, max_tokens=3000)
