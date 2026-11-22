@@ -61,6 +61,9 @@ def render_pptx(markdown_text: str, cover: CoverInfo, path: Path, work_dir: Path
                 bullets.append((f"**{plain(block['text'])}**", 0))
             elif kind in ("paragraph", "callout"):
                 bullets.append((block["text"], 0))
+            elif kind == "math":
+                from .math import tex_to_unicode
+                bullets.append((tex_to_unicode(block["tex"]), 1))
             elif kind == "list":
                 nested = bool(bullets) and bullets[-1][0].startswith("**")
                 bullets.extend((item, 1 if nested else 0) for item in block["items"])

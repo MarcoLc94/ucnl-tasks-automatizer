@@ -282,6 +282,13 @@ def _page_break_element(doc):
     return p._p
 
 
+def _math_to_text(value: str) -> str:
+    """En el Word del profesor las fórmulas van como texto legible: \\( b^{T}y \\) → bᵀy."""
+    from .math import split_inline, tex_to_unicode
+    value = re.sub(r"\\\[(.+?)\\\]|\$\$(.+?)\$\$", lambda m: tex_to_unicode(m.group(1) or m.group(2)), value, flags=re.S)
+    return "".join(str(p) for p in split_inline(value))
+
+
 def fill(original: Path, answers_text: str, out_path: Path, cover=None) -> tuple[Path, list[str]]:
     """
     Escribe las respuestas en una copia del Word. Si se da `cover` (CoverInfo), antepone la portada.
@@ -295,7 +302,7 @@ def fill(original: Path, answers_text: str, out_path: Path, cover=None) -> tuple
     start_blocks, end_blocks = [], []
 
     for a in parse_answers(answers_text):
-        value = a["value"]
+        value = _math_to_text(a["value"])
         if "where" in a:
             (start_blocks if a["where"] == "INICIO" else end_blocks).append(value)
             continue

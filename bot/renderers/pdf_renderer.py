@@ -31,15 +31,36 @@ figure img { max-width: 100%; }
 figcaption { font-size: 0.85em; color: #666; margin-top: 0.3em; }
 figure.photo img { width: 100%; max-height: 3.2in; object-fit: cover; border-radius: 6px; }
 figure.diagram img { max-width: 100%; max-height: 8in; }
+img.math-inline { vertical-align: middle; }
+.math { text-align: center; margin: 0.6em 0; }
+img.math-block { max-width: 100%; }
 blockquote.callout { margin: 0.6em 0; padding: 0.5em 0.8em; border-left: 4px solid var(--accent);
   background: var(--soft); font-size: 1.05em; }
 blockquote.callout strong { color: var(--accent); font-size: 1.4em; }
 """
 
 
+_MATH_DIR: Path | None = None  # carpeta de trabajo del documento en curso (fórmulas dibujadas)
+
+
+def _math_img(tex: str, display: bool) -> str | None:
+    from .math import RENDER_FONT_PX, math_image
+    img = math_image(tex, display, _MATH_DIR) if _MATH_DIR else None
+    if not img:
+        return None
+    png, w, h = img
+    b64 = base64.b64encode(png.read_bytes()).decode()
+    cls = "math-block" if display else "math-inline"
+    return f'<img class="{cls}" style="height:{h / RENDER_FONT_PX:.3f}em" src="data:image/png;base64,{b64}">'
+
+
 def _inline(text: str) -> str:
+    from .math import MathChunk
     out = []
     for chunk, bold, italic in inline_runs(text):
+        if isinstance(chunk, MathChunk):
+            out.append(_math_img(chunk.tex, False) or html.escape(str(chunk)))
+            continue
         s = html.escape(chunk)
         if bold:
             s = f"<strong>{s}</strong>"
@@ -50,7 +71,12 @@ def _inline(text: str) -> str:
 
 
 def _block_html(block: dict, work_dir: Path, counter: list[int]) -> str:
+    global _MATH_DIR
+    _MATH_DIR = work_dir
     kind = block["type"]
+    if kind == "math":
+        from .math import tex_to_unicode
+        return f'<div class="math">{_math_img(block["tex"], True) or html.escape(tex_to_unicode(block["tex"]))}</div>'
     if kind == "heading":
         lvl = max(2, block["level"])  # h1 queda para el título del documento
         return f"<h{lvl}>{_inline(block['text'])}</h{lvl}>"

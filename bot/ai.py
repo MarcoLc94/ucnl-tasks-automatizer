@@ -125,6 +125,8 @@ _MARKDOWN_RULES = """Escribe la respuesta en Markdown usando SOLO estos elemento
 - Párrafos normales, **negritas** y *cursivas*
 - Listas con "- " o "1. "
 - Cifras o frases destacadas con "> **dato** explicación"
+- Fórmulas y expresiones matemáticas en LaTeX: dentro del texto con \\( … \\) (p. ej. \\( x_1 + 2x_2 \\le 10 \\))
+  y las importantes en su propia línea con \\[ … \\]. Nunca uses $ para fórmulas ni escribas LaTeX sin delimitadores.
 - Tablas Markdown (| col | col | con fila separadora |---|---|) cuando comparar información ayude
 - Gráficas, SOLO si la tarea lo pide o si hay datos reales y conocidos que graficar (nunca inventes estadísticas), con este bloque exacto:
 ```grafica

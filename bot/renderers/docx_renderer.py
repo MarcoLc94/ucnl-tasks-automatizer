@@ -26,6 +26,8 @@ def render_docx(
     Portada → Introducción → Contenido → Conclusiones → Referencias, cada parte en hoja nueva.
     body_image: si se da (infografía), el contenido es esa imagen a página completa.
     """
+    global _MATH_DIR
+    _MATH_DIR = work_dir
     doc = Document()
     _setup_styles(doc)
 
@@ -160,6 +162,19 @@ def _add_blocks(doc, blocks: list[dict], work_dir: Path, counter: list[int]):
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             _add_runs(p, block["text"])
+        elif kind == "math":
+            from .math import RENDER_FONT_PX, math_image, tex_to_unicode
+            img = math_image(block["tex"], True, work_dir)
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            if img:
+                png, w, h = img
+                height = Pt(h * 12 / RENDER_FONT_PX)
+                if w * 12 / RENDER_FONT_PX > 440:  # no pasar del ancho de la página (~6.1 in)
+                    height = Pt(h * 440 / w)
+                p.add_run().add_picture(str(png), height=height)
+            else:
+                p.add_run(tex_to_unicode(block["tex"])).italic = True
         elif kind == "callout":
             p = doc.add_paragraph(style="Intense Quote")
             _add_runs(p, block["text"])
@@ -247,8 +262,18 @@ def _add_cover(doc, cover: CoverInfo):
     _page_break(doc)
 
 
+_MATH_DIR: Path | None = None  # carpeta de trabajo del documento en curso (fórmulas dibujadas)
+
+
 def _add_runs(paragraph, text: str):
+    from .math import MathChunk, RENDER_FONT_PX, math_image
     for chunk, bold, italic in inline_runs(text):
+        if isinstance(chunk, MathChunk) and _MATH_DIR is not None:
+            img = math_image(chunk.tex, False, _MATH_DIR)
+            if img:
+                png, _, h = img
+                paragraph.add_run().add_picture(str(png), height=Pt(h * 11 / RENDER_FONT_PX))
+                continue
         r = paragraph.add_run(chunk)
         r.bold = bold or None
         r.italic = italic or None

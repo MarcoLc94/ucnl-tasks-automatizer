@@ -48,6 +48,21 @@ def parse(text: str) -> list[dict]:
             i += 1
             continue
 
+        # Fórmula en línea aparte: \[ … \]  o  $$ … $$ (puede ocupar varias líneas)
+        if stripped.startswith(("\\[", "$$")):
+            flush_paragraph()
+            opener, closer = ("\\[", "\\]") if stripped.startswith("\\[") else ("$$", "$$")
+            buf = stripped[len(opener):]
+            while closer not in buf and i + 1 < len(lines):
+                i += 1
+                buf += "\n" + lines[i].strip()
+            tex, _, rest = buf.partition(closer)
+            blocks.append({"type": "math", "tex": tex.strip()})
+            i += 1
+            if rest.strip():
+                paragraph.append(rest.strip())
+            continue
+
         fence = _FENCE.match(line)
         if fence:
             flush_paragraph()
@@ -142,7 +157,21 @@ def _split_row(line: str) -> list[str]:
 
 
 def inline_runs(text: str) -> list[tuple[str, bool, bool]]:
-    """Divide el texto en (fragmento, negrita, cursiva)."""
+    """
+    Divide el texto en (fragmento, negrita, cursiva). Las fórmulas \\( … \\) salen como MathChunk
+    (un str con su versión Unicode y el LaTeX en .tex), para que cada formato decida cómo dibujarlas.
+    """
+    from .math import MathChunk, split_inline
+    runs = []
+    for segment in split_inline(text):
+        if isinstance(segment, MathChunk):
+            runs.append((segment, False, False))
+            continue
+        runs.extend(_format_runs(segment))
+    return runs
+
+
+def _format_runs(text: str) -> list[tuple[str, bool, bool]]:
     runs = []
     for part in _INLINE.split(text):
         if not part:

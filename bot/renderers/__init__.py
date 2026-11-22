@@ -182,7 +182,11 @@ async def build_document(
     work_dir = Path(tempfile.mkdtemp(prefix="ucnl_render_"))
     try:
         # Los diagramas se dibujan antes (es asíncrono); los renderizadores solo insertan el PNG
-        await render_diagrams(parse(markdown_text), work_dir)
+        blocks = parse(markdown_text)
+        await render_diagrams(blocks, work_dir)
+        # Fórmulas LaTeX → PNG (MathJax) antes de armar el documento
+        from .math import collect, render_math
+        await render_math(collect(blocks), work_dir)
         if fmt == "docx":
             render_docx(markdown_text, cover, path, work_dir, include_toc=include_toc)
         elif fmt == "pptx":
